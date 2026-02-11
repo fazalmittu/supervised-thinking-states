@@ -26,12 +26,13 @@ load_dotenv()
 GEMINI_MAX_CONCURRENCY = int(os.getenv("GEMINI_MAX_CONCURRENCY", "2"))
 GEMINI_MIN_DELAY = float(os.getenv("GEMINI_MIN_DELAY", "0.2"))
 GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "5"))
+GEMINI_RATE_LIMIT_BACKOFF = float(os.getenv("GEMINI_RATE_LIMIT_BACKOFF", "10.0"))
 
 
 def parse_gsm8k_answer(answer_text: str) -> dict:
     """
     Split GSM8K answer on '####' to get reasoning steps + final numeric answer.
-    Strip <<calc>> annotations from steps.
+    Extract calculation trace from <<...>> annotations.
 
     Args:
         answer_text: Raw answer string from GSM8K dataset
@@ -50,7 +51,9 @@ def parse_gsm8k_answer(answer_text: str) -> dict:
         numbers = re.findall(r'-?[\d,]+\.?\d*', answer_text)
         final_answer = numbers[-1] if numbers else ""
 
-    # Strip <<calc>> annotations
+    # Extract calculation trace from <<...>>
+    calc_trace = re.findall(r'<<[^<>]+>>', steps_text)
+    # Strip <<calc>> annotations from steps
     steps_text = re.sub(r'<<.*?>>', '', steps_text)
 
     # Split into individual steps
@@ -62,14 +65,14 @@ def parse_gsm8k_answer(answer_text: str) -> dict:
     return {
         "steps": steps,
         "final_answer": final_answer,
+        "calc_trace": calc_trace,
     }
 
 
 def build_alignment_prompt(question: str, steps: list) -> str:
     """
-    Build prompt asking Claude to identify, for each reasoning step,
-    the earliest character position in the question where that step
-    becomes inferable.
+    Build prompt asking teacher to insert <THINK> markers at the earliest
+    position where each calculation becomes inferable.
 
     Args:
         question: The GSM8K question text
@@ -78,29 +81,51 @@ def build_alignment_prompt(question: str, steps: list) -> str:
     Returns:
         Prompt string for teacher LLM
     """
-    steps_formatted = "\n".join(f"Step {i+1}: {step}" for i, step in enumerate(steps))
+    steps_formatted = ", ".join(steps)
 
-    prompt = f"""You are analyzing a grade school math problem to determine when each reasoning step becomes inferable from the question text.
+    prompt = f"""You are an expert in computational linguistics. Your task is to augment a given query with thinking markers (<THINK>) based on a provided reasoning trace. This involves identifying the precise locations in the text where specific calculations can be performed.
+Task Instructions:
+1. Analyze Inputs: You will receive two inputs:
+• A Query: A question or word problem.
+• A Reasoning Trace: An ordered list of strings, where each string is a distinct mathematical calculation required to solve the query.
+2. Produce Two Outputs:
+• query: This is the original Query text, but with the special token <THINK> inserted at specific locations.
+• thinking: This is the ordered list of calculations.
+3. Rules for <THINK> Placement:
+• The number of <THINK> tokens inserted into the query must be exactly equal to the number of calculations in the Reasoning Trace.
+• The order of the <THINK> tokens in the query must correspond one-to-one with the order of the calculations in the Reasoning Trace.
+• For each calculation, you must insert its corresponding <THINK> token at the earliest possible location in the query. This location is defined as the point immediately after the word or phrase that provides the final piece of information needed to perform that specific calculation.
+4. Rule for the thinking List:
+• The thinking output list is simply a direct copy of the ordered list of calculations provided in the Input Reasoning Trace.
+5. Output Format:
+• The output should be provided as a python dictionary with two keys: query and thinking.
+• The values should be wrapped in <<>> to support easy parsing.
+• Example:
+{{
+"query": "<<Your modified query here>>",
+"thinking": <<['<<calculation1>>', '<<calculation2>>', ...]>>
+}}
+Examples
+Example 1:
+• Input Query: 'Hannah has three dogs. The first dog eats 1.5 cups of dog food a day. The second dog eats twice as much while the third dog eats 2.5 cups more than the second dog. How many cups of dog food should Hannah prepare in a day for her three dogs?'
+• Input Reasoning Trace: ['<<1.5*2=3>>', '<<3+2.5=5.5>>', '<<1.5+3+5.5=10>>']
+Required Output:
+{{
+"query": <<'Hannah has three dogs. The first dog eats 1.5 cups of dog food a day. The second dog eats twice as much<THINK> while the third dog eats 2.5 cups more than the second dog.<THINK> How many cups of dog food should Hannah prepare in a day for her three dogs?<THINK> '>>,
+"thinking": <<['<<1.5*2=3>>', '<<3+2.5=5.5>>', '<<1.5+3+5.5=10>>']>>
+}}
+Task
+Now, perform this transformation for the following input and return your output as a python dictionary.
+Query: <<QUERY>>
+Reasoning Trace: <<REASONING TRACE>>
+Produce your output as a python dictionary in the specified format below:
+{{
+"query": <<ADD YOUR OUTPUT HERE>>,
+"thinking": <<ADD YOUR OUTPUT HERE>>
+}}
 
-Question (length = {len(question)} characters):
-\"{question}\"
-
-Reasoning steps:
-{steps_formatted}
-
-For each reasoning step, identify the earliest character position (0-indexed) in the question where that step becomes inferable. A step is "inferable" once the reader has seen enough of the question to logically derive that step.
-
-Rules:
-- Positions must be monotonically non-decreasing (step N position >= step N-1 position)
-- Position 0 means the step is inferable from the very beginning
-- Position equal to question length means the step requires the full question
-
-Respond with EXACTLY one line per step in this format:
-Step 1: position=M
-Step 2: position=M
-...
-
-No other text."""
+Query: {question}
+Reasoning Trace: [{steps_formatted}]"""
 
     return prompt
 
@@ -134,8 +159,12 @@ def call_teacher_llm(prompt: str) -> str:
                 return response.text or ""
             except Exception as e:
                 last_err = e
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 30.0)
+                err_text = str(e).lower()
+                if "rate" in err_text and "limit" in err_text:
+                    time.sleep(GEMINI_RATE_LIMIT_BACKOFF)
+                else:
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 30.0)
         raise last_err
 
     import anthropic
@@ -162,10 +191,9 @@ async def call_teacher_llm_async(client, prompt: str) -> str:
     return message.content[0].text
 
 
-def parse_alignment_response(response: str, num_steps: int) -> list:
+def parse_alignment_response(response: str, num_steps: int, question: str) -> tuple[str, list] | None:
     """
-    Parse 'Step N: position=M' from LLM output.
-    Fallback to uniform distribution on parse failure.
+    Parse <THINK> marker positions and thinking list from LLM output.
 
     Args:
         response: Raw LLM response text
@@ -174,26 +202,29 @@ def parse_alignment_response(response: str, num_steps: int) -> list:
     Returns:
         List of character positions (one per step)
     """
-    positions = []
-    for i in range(1, num_steps + 1):
-        pattern = rf'Step\s+{i}\s*:\s*position\s*=\s*(\d+)'
-        match = re.search(pattern, response)
-        if match:
-            positions.append(int(match.group(1)))
-        else:
-            positions.append(None)
+    # find marker positions while aligning to the original question
+    text = response.strip()
+    query_match = re.search(r'"query"\s*:\s*<<(.+?)>>', text, re.DOTALL)
+    thinking_match = re.search(r'"thinking"\s*:\s*<<(\[.+?\])>>', text, re.DOTALL)
+    if not query_match or not thinking_match:
+        return None
 
-    # Fill missing with uniform distribution
-    if any(p is None for p in positions):
-        # Fallback: uniform distribution
-        positions = [int(i * 100 / num_steps) for i in range(num_steps)]
+    query_with_markers = query_match.group(1).strip()
+    thinking_raw = thinking_match.group(1).strip()
 
-    # Enforce monotonicity
-    for i in range(1, len(positions)):
-        if positions[i] < positions[i-1]:
-            positions[i] = positions[i-1]
+    try:
+        thinking_list = json.loads(thinking_raw.replace("'", '"'))
+    except Exception:
+        return None
 
-    return positions
+    if len(thinking_list) != num_steps:
+        return None
+
+    # validate that removing markers recovers the original question
+    if query_with_markers.replace("<THINK>", "") != question:
+        return None
+
+    return query_with_markers, thinking_list
 
 
 def char_pos_to_token_pos(question: str, char_positions: list, tokenizer) -> list:
@@ -248,8 +279,9 @@ def align_single_example(question: str, answer: str, tokenizer) -> dict:
     parsed = parse_gsm8k_answer(answer)
     steps = parsed["steps"]
     final_answer = parsed["final_answer"]
+    calc_trace = parsed["calc_trace"]
 
-    if not steps:
+    if not calc_trace:
         return None
 
     # Get token-level info
@@ -262,13 +294,31 @@ def align_single_example(question: str, answer: str, tokenizer) -> dict:
         return None
 
     # Call teacher LLM for alignment
-    prompt = build_alignment_prompt(question, steps)
+    prompt = build_alignment_prompt(question, calc_trace)
     try:
         response = call_teacher_llm(prompt)
-        char_positions = parse_alignment_response(response, len(steps))
+        parsed_out = parse_alignment_response(response, len(calc_trace), question)
     except Exception as e:
         print(f"Teacher LLM call failed: {e}. Using uniform fallback.")
-        char_positions = [int(i * len(question) / len(steps)) for i in range(len(steps))]
+        parsed_out = None
+
+    if parsed_out is None:
+        return None
+
+    query_with_markers, thinking_list = parsed_out
+    if thinking_list != calc_trace:
+        return None
+
+    char_positions = []
+    clean_idx = 0
+    i = 0
+    while i < len(query_with_markers):
+        if query_with_markers.startswith("<THINK>", i):
+            char_positions.append(clean_idx)
+            i += 7
+            continue
+        clean_idx += 1
+        i += 1
 
     # Convert to token positions
     token_positions = char_pos_to_token_pos(question, char_positions, tokenizer)
@@ -282,7 +332,7 @@ def align_single_example(question: str, answer: str, tokenizer) -> dict:
     # Build chunk_thoughts: concatenate steps assigned to each chunk
     chunk_thoughts = []
     for c in range(num_chunks):
-        assigned_steps = [steps[i] for i, ca in enumerate(step_chunk_assignments) if ca == c]
+        assigned_steps = [calc_trace[i] for i, ca in enumerate(step_chunk_assignments) if ca == c]
         if assigned_steps:
             chunk_thoughts.append(" ".join(assigned_steps))
         else:
@@ -308,8 +358,9 @@ async def align_single_example_async(
     parsed = parse_gsm8k_answer(answer)
     steps = parsed["steps"]
     final_answer = parsed["final_answer"]
+    calc_trace = parsed["calc_trace"]
 
-    if not steps:
+    if not calc_trace:
         return None
 
     question_tokens = tokenizer.encode(question, add_special_tokens=False)
@@ -320,13 +371,31 @@ async def align_single_example_async(
     if num_chunks == 0:
         return None
 
-    prompt = build_alignment_prompt(question, steps)
+    prompt = build_alignment_prompt(question, calc_trace)
     try:
         response = await call_teacher_llm_async(client, prompt)
-        char_positions = parse_alignment_response(response, len(steps))
+        parsed_out = parse_alignment_response(response, len(calc_trace), question)
     except Exception as e:
         print(f"Teacher LLM call failed: {e}. Using uniform fallback.")
-        char_positions = [int(i * len(question) / len(steps)) for i in range(len(steps))]
+        parsed_out = None
+
+    if parsed_out is None:
+        return None
+
+    query_with_markers, thinking_list = parsed_out
+    if thinking_list != calc_trace:
+        return None
+
+    char_positions = []
+    clean_idx = 0
+    i = 0
+    while i < len(query_with_markers):
+        if query_with_markers.startswith("<THINK>", i):
+            char_positions.append(clean_idx)
+            i += 7
+            continue
+        clean_idx += 1
+        i += 1
 
     token_positions = char_pos_to_token_pos(question, char_positions, tokenizer)
 
@@ -337,7 +406,7 @@ async def align_single_example_async(
 
     chunk_thoughts = []
     for c in range(num_chunks):
-        assigned_steps = [steps[i] for i, ca in enumerate(step_chunk_assignments) if ca == c]
+        assigned_steps = [calc_trace[i] for i, ca in enumerate(step_chunk_assignments) if ca == c]
         if assigned_steps:
             chunk_thoughts.append(" ".join(assigned_steps))
         else:
@@ -377,7 +446,7 @@ async def _align_batch_async(examples: list, tokenizer, concurrency: int = 10):
     return await asyncio.gather(*tasks, return_exceptions=True)
 
 
-def align_dataset(split: str = "train", tokenizer=None, max_examples: int = None):
+def align_dataset(split: str = "train", tokenizer=None, max_examples: int = None, output_suffix: str = ""):
     """
     Process full GSM8K split with teacher LLM alignment.
 
@@ -395,7 +464,7 @@ def align_dataset(split: str = "train", tokenizer=None, max_examples: int = None
     cache_dir = Path(GSM8K_CACHE_DIR)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    output_path = cache_dir / f"{split}_aligned.jsonl"
+    output_path = cache_dir / f"{split}_aligned{output_suffix}.jsonl"
 
     # Load dataset
     print(f"Loading GSM8K {split} split...")
@@ -449,6 +518,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Align GSM8K with a teacher LLM.")
     parser.add_argument("--test-only", action="store_true", help="Run a single-example test.")
     parser.add_argument("--max-examples", type=int, default=None, help="Limit number of examples per split.")
+    parser.add_argument("--output-suffix", type=str, default="", help="Suffix for output JSONL files.")
+    parser.add_argument("--concurrency", type=int, default=None, help="Max concurrent requests (Gemini only).")
+    parser.add_argument("--min-delay", type=float, default=None, help="Min delay between Gemini requests.")
     args = parser.parse_args()
 
     tokenizer = GPT2Tokenizer.from_pretrained(MODEL_NAME)
@@ -467,5 +539,10 @@ if __name__ == "__main__":
             print("Alignment failed!")
     else:
         # Full dataset alignment (optionally limited)
-        align_dataset("train", tokenizer, max_examples=args.max_examples)
-        align_dataset("test", tokenizer, max_examples=args.max_examples)
+        if args.concurrency is not None:
+            GEMINI_MAX_CONCURRENCY = args.concurrency
+        if args.min_delay is not None:
+            GEMINI_MIN_DELAY = args.min_delay
+
+        align_dataset("train", tokenizer, max_examples=args.max_examples, output_suffix=args.output_suffix)
+        align_dataset("test", tokenizer, max_examples=args.max_examples, output_suffix=args.output_suffix)

@@ -10,7 +10,7 @@ from transformers import GPT2Tokenizer
 
 from config import (
     CHUNK_SIZE, MIN_FLIPS, MAX_FLIPS,
-    GSM8K_CACHE_DIR, GSM8K_MAX_THOUGHT_LEN, BOS_TOKEN, EOS_TOKEN
+    GSM8K_CACHE_DIR, GSM8K_MAX_THOUGHT_LEN, BOS_TOKEN, EOS_TOKEN, GSM8K_ALIGNED_SUFFIX
 )
 
 
@@ -199,13 +199,15 @@ class GSM8KDataset(Dataset):
         split: str = "train",
         cache_dir: str = GSM8K_CACHE_DIR,
         tokenizer: GPT2Tokenizer = None,
-        limit: int = None
+        limit: int = None,
+        aligned_suffix: str = GSM8K_ALIGNED_SUFFIX
     ):
         self.split = split
         self.cache_dir = Path(cache_dir)
         self.tokenizer = tokenizer or GPT2Tokenizer.from_pretrained("gpt2")
+        self.aligned_suffix = aligned_suffix
 
-        path = self.cache_dir / f"{split}_aligned.jsonl"
+        path = self.cache_dir / f"{split}_aligned{self.aligned_suffix}.jsonl"
         if not path.exists():
             raise FileNotFoundError(
                 f"Missing GSM8K cache at {path}. Run align_gsm8k.py first."

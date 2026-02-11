@@ -48,6 +48,7 @@ TEACHER_MODEL = "gemini-2.5-flash"
 
 # GSM8K data
 GSM8K_CACHE_DIR = "data/gsm8k"
+GSM8K_ALIGNED_SUFFIX = ""
 
 # Device
 import torch
