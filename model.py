@@ -4,8 +4,14 @@ import torch
 import torch.nn as nn
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
-from config import HIDDEN_DIM, CHUNK_SIZE, L_IN, L_OUT, DEVICE, MODEL_NAME
-from modules import ThinkingBlock, CompressionBlock
+from config import (
+    HIDDEN_DIM, CHUNK_SIZE, GSM8K_CHUNK_SIZE, GSM8K_MAX_THOUGHT_LEN,
+    L_IN, L_OUT, DEVICE, MODEL_NAME, TASK, BOS_TOKEN, EOS_TOKEN
+)
+from modules import (
+    ThinkingBlock, CompressionBlock,
+    AutoregressiveThinkingBlock, TransformerCompressionBlock
+)
 
 
 class ThinkingStatesModel(nn.Module):
@@ -24,6 +30,7 @@ class ThinkingStatesModel(nn.Module):
         chunk_size: int = CHUNK_SIZE,
         l_in: int = L_IN,
         l_out: int = L_OUT,
+        task: str = TASK,
     ):
         super().__init__()
 
@@ -32,17 +39,43 @@ class ThinkingStatesModel(nn.Module):
         self.tokenizer = GPT2Tokenizer.from_pretrained(model_name)
         self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        vocab_size = self.tokenizer.vocab_size
+        self.task = task
+
+        if self.task == "gsm8k":
+            added = self.tokenizer.add_special_tokens(
+                {"additional_special_tokens": [BOS_TOKEN, EOS_TOKEN]}
+            )
+            if added > 0:
+                self.backbone.resize_token_embeddings(len(self.tokenizer))
+
+        vocab_size = len(self.tokenizer)
         hidden_dim = self.backbone.config.n_embd
 
-        self.chunk_size = chunk_size
+        if self.task == "gsm8k":
+            self.chunk_size = GSM8K_CHUNK_SIZE
+        else:
+            self.chunk_size = chunk_size
         self.l_in = l_in
         self.l_out = l_out
         self.hidden_dim = hidden_dim
 
         # Thinking States modules
-        self.thinking_block = ThinkingBlock(vocab_size, hidden_dim)
-        self.compression_block = CompressionBlock(vocab_size, hidden_dim, chunk_size)
+        if self.task == "gsm8k":
+            self.thinking_block = AutoregressiveThinkingBlock(
+                vocab_size,
+                hidden_dim=hidden_dim,
+                max_thought_len=GSM8K_MAX_THOUGHT_LEN,
+                chunk_size=self.chunk_size,
+            )
+            self.compression_block = TransformerCompressionBlock(
+                vocab_size,
+                hidden_dim=hidden_dim,
+                chunk_size=self.chunk_size,
+                max_thought_len=GSM8K_MAX_THOUGHT_LEN,
+            )
+        else:
+            self.thinking_block = ThinkingBlock(vocab_size, hidden_dim)
+            self.compression_block = CompressionBlock(vocab_size, hidden_dim, self.chunk_size)
 
         # Learnable gate for injection (init to 0 for stability)
         self.injection_gate = nn.Parameter(torch.zeros(1))
@@ -89,7 +122,8 @@ class ThinkingStatesModel(nn.Module):
         self,
         chunk_thought_ids: list,
         seq_len: int,
-        batch_size: int
+        batch_size: int,
+        chunk_thought_masks: list = None,
     ) -> torch.Tensor:
         """
         Build the full state tensor from per-chunk thought ids.
@@ -110,7 +144,11 @@ class ThinkingStatesModel(nn.Module):
         for chunk_idx, thought_ids in enumerate(chunk_thought_ids):
             # Compress thoughts to state
             thought_ids = thought_ids.to(device)
-            chunk_state = self.compression_block(thought_ids)  # (batch, chunk_size, hidden_dim)
+            if chunk_thought_masks is not None:
+                thought_mask = chunk_thought_masks[chunk_idx].to(device)
+                chunk_state = self.compression_block(thought_ids, attention_mask=thought_mask)
+            else:
+                chunk_state = self.compression_block(thought_ids)  # (batch, chunk_size, hidden_dim)
 
             # Place in state tensor at correct positions
             start_pos = chunk_idx * self.chunk_size
@@ -127,6 +165,7 @@ class ThinkingStatesModel(nn.Module):
         attention_mask: torch.Tensor = None,
         labels: torch.Tensor = None,
         chunk_thought_ids: list = None,
+        chunk_thought_masks: list = None,
     ):
         """
         Forward pass with teacher-forced state injection.
@@ -146,7 +185,7 @@ class ThinkingStatesModel(nn.Module):
         # Build state tensor from teacher-forced thoughts
         if chunk_thought_ids is not None:
             self._state_to_inject = self.build_state_tensor(
-                chunk_thought_ids, seq_len, batch_size
+                chunk_thought_ids, seq_len, batch_size, chunk_thought_masks
             )
         else:
             self._state_to_inject = None
@@ -168,7 +207,7 @@ class ThinkingStatesModel(nn.Module):
         thinking_loss = None
         if chunk_thought_ids is not None and extracted_hidden is not None:
             thinking_loss = self._compute_thinking_loss(
-                extracted_hidden, chunk_thought_ids
+                extracted_hidden, chunk_thought_ids, chunk_thought_masks
             )
 
         # Clear state
@@ -184,7 +223,8 @@ class ThinkingStatesModel(nn.Module):
     def _compute_thinking_loss(
         self,
         extracted_hidden: torch.Tensor,
-        chunk_thought_ids: list
+        chunk_thought_ids: list,
+        chunk_thought_masks: list = None,
     ) -> torch.Tensor:
         """
         Compute cross-entropy loss for thinking block predictions.
@@ -219,16 +259,38 @@ class ThinkingStatesModel(nn.Module):
                 padding = torch.zeros(batch_size, pad_len, self.hidden_dim, device=device)
                 chunk_hidden = torch.cat([chunk_hidden, padding], dim=1)
 
-            # Get logits from thinking block (direct prediction, no shifting)
             thought_ids = thought_ids.to(device)
-            logits = self.thinking_block(chunk_hidden, thought_ids)
+            if self.task == "gsm8k":
+                thought_mask = None
+                if chunk_thought_masks is not None:
+                    thought_mask = chunk_thought_masks[chunk_idx].to(device)
 
-            # Compute cross-entropy loss (direct prediction)
-            loss_fn = nn.CrossEntropyLoss(ignore_index=self.tokenizer.pad_token_id)
-            chunk_loss = loss_fn(
-                logits.view(-1, logits.size(-1)),
-                thought_ids.view(-1)
-            )
+                logits = self.thinking_block(
+                    chunk_hidden,
+                    thought_ids,
+                    thought_mask
+                )
+
+                labels = thought_ids[:, 1:].contiguous()
+                if thought_mask is not None:
+                    mask = thought_mask[:, 1:].contiguous()
+                    labels = labels.masked_fill(mask == 0, self.tokenizer.pad_token_id)
+
+                loss_fn = nn.CrossEntropyLoss(ignore_index=self.tokenizer.pad_token_id)
+                chunk_loss = loss_fn(
+                    logits.view(-1, logits.size(-1)),
+                    labels.view(-1)
+                )
+            else:
+                # Get logits from thinking block (direct prediction, no shifting)
+                logits = self.thinking_block(chunk_hidden, thought_ids)
+
+                # Compute cross-entropy loss (direct prediction)
+                loss_fn = nn.CrossEntropyLoss(ignore_index=self.tokenizer.pad_token_id)
+                chunk_loss = loss_fn(
+                    logits.view(-1, logits.size(-1)),
+                    thought_ids.view(-1)
+                )
 
             if not torch.isnan(chunk_loss):
                 total_loss += chunk_loss

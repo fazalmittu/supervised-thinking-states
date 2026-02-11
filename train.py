@@ -7,13 +7,18 @@ from tqdm import tqdm
 
 from config import (
     DEVICE, BATCH_SIZE, NUM_EPOCHS, LEARNING_RATE,
-    LAMBDA_THINK, TRAIN_SIZE, VAL_SIZE, MIN_FLIPS, MAX_FLIPS
+    LAMBDA_THINK, TRAIN_SIZE, VAL_SIZE, MIN_FLIPS, MAX_FLIPS,
+    GSM8K_BATCH_SIZE, GSM8K_NUM_EPOCHS, GSM8K_LEARNING_RATE, GSM8K_LAMBDA_THINK,
+    TASK
 )
-from data import ParityDataset, get_collate_fn
+from data import (
+    ParityDataset, get_collate_fn,
+    GSM8KDataset, get_gsm8k_collate_fn
+)
 from model import ThinkingStatesModel
 
 
-def train_epoch(model, dataloader, optimizer, device):
+def train_epoch(model, dataloader, optimizer, device, lambda_think):
     """Train for one epoch."""
     model.train()
     total_lm_loss = 0.0
@@ -25,6 +30,7 @@ def train_epoch(model, dataloader, optimizer, device):
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
         chunk_thought_ids = batch["chunk_thought_ids"]
+        chunk_thought_masks = batch.get("chunk_thought_masks")
 
         optimizer.zero_grad()
 
@@ -32,7 +38,8 @@ def train_epoch(model, dataloader, optimizer, device):
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
-            chunk_thought_ids=chunk_thought_ids
+            chunk_thought_ids=chunk_thought_ids,
+            chunk_thought_masks=chunk_thought_masks
         )
 
         lm_loss = outputs["lm_loss"]
@@ -41,7 +48,7 @@ def train_epoch(model, dataloader, optimizer, device):
         # Combined loss
         loss = lm_loss
         if think_loss is not None:
-            loss = loss + LAMBDA_THINK * think_loss
+            loss = loss + lambda_think * think_loss
 
         loss.backward()
         optimizer.step()
@@ -72,12 +79,14 @@ def evaluate(model, dataloader, device):
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
             chunk_thought_ids = batch["chunk_thought_ids"]
+            chunk_thought_masks = batch.get("chunk_thought_masks")
 
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 labels=labels,
-                chunk_thought_ids=chunk_thought_ids
+                chunk_thought_ids=chunk_thought_ids,
+                chunk_thought_masks=chunk_thought_masks
             )
 
             lm_loss = outputs["lm_loss"]
@@ -91,21 +100,20 @@ def evaluate(model, dataloader, device):
             # Check accuracy - run forward again to get logits with state injection
             # The model.forward() sets up the injection hooks
             model._state_to_inject = model.build_state_tensor(
-                chunk_thought_ids, input_ids.shape[1], input_ids.shape[0]
+                chunk_thought_ids, input_ids.shape[1], input_ids.shape[0], chunk_thought_masks
             )
-            backbone_out = model.backbone(input_ids=input_ids)
+            backbone_out = model.backbone(input_ids=input_ids, attention_mask=attention_mask)
             logits = backbone_out.logits
             model._state_to_inject = None
 
-            # Find answer position (where labels != -100)
+            # Exact-match accuracy on answer tokens
             for i in range(input_ids.shape[0]):
                 answer_mask = labels[i] != -100
                 if answer_mask.any():
-                    answer_pos = answer_mask.nonzero()[0].item()
-                    pred_token = logits[i, answer_pos - 1].argmax().item()
-                    true_token = labels[i, answer_pos].item()
-
-                    if pred_token == true_token:
+                    answer_positions = answer_mask.nonzero().squeeze(-1)
+                    preds = logits[i, answer_positions - 1].argmax(dim=-1)
+                    trues = labels[i, answer_positions]
+                    if torch.equal(preds, trues):
                         correct += 1
                     total += 1
 
@@ -128,33 +136,45 @@ def main():
 
     # Create datasets
     print("Creating datasets...")
-    train_dataset = ParityDataset(TRAIN_SIZE, MIN_FLIPS, MAX_FLIPS, tokenizer)
-    val_dataset = ParityDataset(VAL_SIZE, MIN_FLIPS, MAX_FLIPS, tokenizer)
-
-    collate_fn = get_collate_fn(tokenizer)
+    if TASK == "gsm8k":
+        train_dataset = GSM8KDataset("train", tokenizer=tokenizer)
+        val_dataset = GSM8KDataset("test", tokenizer=tokenizer)
+        collate_fn = get_gsm8k_collate_fn(tokenizer)
+        batch_size = GSM8K_BATCH_SIZE
+        num_epochs = GSM8K_NUM_EPOCHS
+        learning_rate = GSM8K_LEARNING_RATE
+        lambda_think = GSM8K_LAMBDA_THINK
+    else:
+        train_dataset = ParityDataset(TRAIN_SIZE, MIN_FLIPS, MAX_FLIPS, tokenizer)
+        val_dataset = ParityDataset(VAL_SIZE, MIN_FLIPS, MAX_FLIPS, tokenizer)
+        collate_fn = get_collate_fn(tokenizer)
+        batch_size = BATCH_SIZE
+        num_epochs = NUM_EPOCHS
+        learning_rate = LEARNING_RATE
+        lambda_think = LAMBDA_THINK
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=batch_size,
         shuffle=True,
         collate_fn=collate_fn
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=batch_size,
         shuffle=False,
         collate_fn=collate_fn
     )
 
     # Optimizer
-    optimizer = AdamW(model.parameters(), lr=LEARNING_RATE)
+    optimizer = AdamW(model.parameters(), lr=learning_rate)
 
     # Training loop
     print("Starting training...")
-    for epoch in range(NUM_EPOCHS):
-        print(f"\nEpoch {epoch + 1}/{NUM_EPOCHS}")
+    for epoch in range(num_epochs):
+        print(f"\nEpoch {epoch + 1}/{num_epochs}")
 
-        train_metrics = train_epoch(model, train_loader, optimizer, DEVICE)
+        train_metrics = train_epoch(model, train_loader, optimizer, DEVICE, lambda_think)
         print(f"Train - LM Loss: {train_metrics['lm_loss']:.4f}, "
               f"Think Loss: {train_metrics['think_loss']:.4f}")
 

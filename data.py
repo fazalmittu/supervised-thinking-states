@@ -1,12 +1,17 @@
-"""Parity task dataset for Thinking States."""
+"""Parity and GSM8K datasets for Thinking States."""
 
 import random
+import json
+from pathlib import Path
 from typing import List, Tuple, Dict
 import torch
 from torch.utils.data import Dataset
 from transformers import GPT2Tokenizer
 
-from config import CHUNK_SIZE, MIN_FLIPS, MAX_FLIPS
+from config import (
+    CHUNK_SIZE, MIN_FLIPS, MAX_FLIPS,
+    GSM8K_CACHE_DIR, GSM8K_MAX_THOUGHT_LEN, BOS_TOKEN, EOS_TOKEN
+)
 
 
 def generate_parity_example(
@@ -183,6 +188,139 @@ def get_collate_fn(tokenizer: GPT2Tokenizer):
     """Returns a collate function with the tokenizer bound."""
     def _collate(batch):
         return collate_fn(batch, tokenizer)
+    return _collate
+
+
+class GSM8KDataset(Dataset):
+    """Dataset for GSM8K with teacher-aligned chunk thoughts."""
+
+    def __init__(
+        self,
+        split: str = "train",
+        cache_dir: str = GSM8K_CACHE_DIR,
+        tokenizer: GPT2Tokenizer = None,
+        limit: int = None
+    ):
+        self.split = split
+        self.cache_dir = Path(cache_dir)
+        self.tokenizer = tokenizer or GPT2Tokenizer.from_pretrained("gpt2")
+
+        path = self.cache_dir / f"{split}_aligned.jsonl"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Missing GSM8K cache at {path}. Run align_gsm8k.py first."
+            )
+
+        self.examples = []
+        with open(path, "r") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                self.examples.append(json.loads(line))
+                if limit is not None and len(self.examples) >= limit:
+                    break
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, idx: int) -> Dict:
+        return self.examples[idx]
+
+
+def gsm8k_collate_fn(batch: List[Dict], tokenizer: GPT2Tokenizer) -> Dict:
+    """
+    Collate function for GSM8K DataLoader.
+
+    Returns:
+        Dict with:
+        - input_ids: (batch, max_seq_len)
+        - attention_mask: (batch, max_seq_len)
+        - labels: (batch, max_seq_len) with -100 for non-answer tokens
+        - chunk_thought_ids: List of (batch, thought_len) tensors
+        - chunk_thought_masks: List of (batch, thought_len) tensors
+        - num_chunks: max number of chunks
+    """
+    bos_id = tokenizer.convert_tokens_to_ids(BOS_TOKEN)
+    eos_id = tokenizer.convert_tokens_to_ids(EOS_TOKEN)
+    if bos_id is None or eos_id is None:
+        raise ValueError("BOS/EOS tokens not found in tokenizer. Ensure model adds them.")
+
+    # Build prompt + answer
+    input_texts = [ex["question"].strip() + "\nAnswer:" for ex in batch]
+    full_texts = [f"{input_texts[i]} {batch[i]['final_answer'].strip()}" for i in range(len(batch))]
+
+    encoded = tokenizer(
+        full_texts,
+        padding=True,
+        return_tensors="pt",
+        add_special_tokens=False
+    )
+
+    input_ids = encoded["input_ids"]
+    attention_mask = encoded["attention_mask"]
+
+    # Labels: -100 for prompt, real ids for answer
+    labels = input_ids.clone()
+    for i, prompt in enumerate(input_texts):
+        prompt_len = len(tokenizer.encode(prompt, add_special_tokens=False))
+        labels[i, :prompt_len] = -100
+
+    # Pad chunk thoughts to same number of chunks
+    max_num_chunks = max(ex["num_chunks"] for ex in batch)
+    chunk_thought_texts = []
+    for ex in batch:
+        thoughts = list(ex["chunk_thoughts"])
+        while len(thoughts) < max_num_chunks:
+            thoughts.append("")
+        chunk_thought_texts.append(thoughts)
+
+    chunk_thought_ids = []
+    chunk_thought_masks = []
+
+    for chunk_idx in range(max_num_chunks):
+        thought_ids_list = []
+        for b in range(len(batch)):
+            thought_text = chunk_thought_texts[b][chunk_idx].strip()
+            thought_ids = [bos_id]
+            if thought_text:
+                thought_ids += tokenizer.encode(thought_text, add_special_tokens=False)
+            thought_ids.append(eos_id)
+
+            if len(thought_ids) > GSM8K_MAX_THOUGHT_LEN:
+                thought_ids = thought_ids[:GSM8K_MAX_THOUGHT_LEN]
+                thought_ids[-1] = eos_id
+
+            thought_ids_list.append(thought_ids)
+
+        max_len = min(
+            GSM8K_MAX_THOUGHT_LEN,
+            max(len(ids) for ids in thought_ids_list)
+        )
+        padded = []
+        masks = []
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        for ids in thought_ids_list:
+            pad_len = max_len - len(ids)
+            padded.append(ids + [pad_id] * pad_len)
+            masks.append([1] * len(ids) + [0] * pad_len)
+
+        chunk_thought_ids.append(torch.tensor(padded, dtype=torch.long))
+        chunk_thought_masks.append(torch.tensor(masks, dtype=torch.long))
+
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
+        "chunk_thought_ids": chunk_thought_ids,
+        "chunk_thought_masks": chunk_thought_masks,
+        "num_chunks": max_num_chunks,
+    }
+
+
+def get_gsm8k_collate_fn(tokenizer: GPT2Tokenizer):
+    """Returns a GSM8K collate function with the tokenizer bound."""
+    def _collate(batch):
+        return gsm8k_collate_fn(batch, tokenizer)
     return _collate
 
 

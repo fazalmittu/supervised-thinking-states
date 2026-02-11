@@ -41,3 +41,7 @@ runs/
 
 # HuggingFace cache
 .cache/
+
+.env
+
+ENGINEERING.md
