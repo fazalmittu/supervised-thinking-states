@@ -157,9 +157,10 @@ class AutoregressiveThinkingBlock(nn.Module):
     """
     Autoregressive Transformer decoder for generating thought tokens.
 
-    Uses cross-attention to chunk hidden states and causal self-attention
-    for autoregressive generation. Designed for GSM8K where thoughts are
-    full natural language reasoning steps.
+    Uses a single causal Transformer block. The chunk hidden states are
+    treated as a prefix context, and thought tokens are generated
+    autoregressively. Designed for GSM8K where thoughts are full natural
+    language reasoning steps.
 
     Input: chunk hidden states (batch, chunk_size, hidden_dim)
     Output (training): logits (batch, thought_len-1, vocab_size) predicting positions 1..T
@@ -178,28 +179,25 @@ class AutoregressiveThinkingBlock(nn.Module):
         self.hidden_dim = hidden_dim
         self.max_thought_len = max_thought_len
         self.vocab_size = vocab_size
+        self.chunk_size = chunk_size
 
-        # Token and position embeddings for thought tokens
         self.token_embedding = nn.Embedding(vocab_size, hidden_dim)
         self.position_embedding = nn.Embedding(max_thought_len, hidden_dim)
 
-        # Project chunk hidden states for cross-attention memory
-        self.chunk_proj = nn.Linear(hidden_dim, hidden_dim)
-
-        # Transformer decoder with cross-attention
-        decoder_layer = nn.TransformerDecoderLayer(
+        # same deal as compression block, encoder layer for causal self-attn without cross attention
+        block = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=num_heads,
             dim_feedforward=hidden_dim * 4,
             batch_first=True,
         )
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=1)
+        # mps needs us to disable nested tensor path
+        self.block = nn.TransformerEncoder(block, num_layers=1, enable_nested_tensor=False)
 
-        # LM head
         self.lm_head = nn.Linear(hidden_dim, vocab_size)
 
     def _make_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        """Create causal attention mask for self-attention."""
+        # mask for self attn
         mask = torch.triu(
             torch.ones(seq_len, seq_len, device=device, dtype=torch.float32),
             diagonal=1
@@ -228,27 +226,27 @@ class AutoregressiveThinkingBlock(nn.Module):
         decoder_input_ids = target_ids[:, :-1]  # (batch, thought_len-1)
         batch_size, dec_len = decoder_input_ids.shape
 
-        # Embed decoder input
-        positions = torch.arange(dec_len, device=decoder_input_ids.device)
+        # embed decoder input
+        positions = torch.arange(dec_len, device=decoder_input_ids.device) + self.chunk_size
         tok_emb = self.token_embedding(decoder_input_ids)
         pos_emb = self.position_embedding(positions)
         decoder_input = tok_emb + pos_emb  # (batch, dec_len, hidden_dim)
 
-        # Project chunk hidden for cross-attention memory
-        memory = self.chunk_proj(chunk_hidden)  # (batch, chunk_size, hidden_dim)
+        # full context: prefix hidden states + thought tokens
+        prefix = chunk_hidden  # (batch, chunk_size, hidden_dim)
+        full_input = torch.cat([prefix, decoder_input], dim=1)  # (batch, chunk_size + dec_len, hidden_dim)
+        total_len = full_input.shape[1]
 
-        # Causal mask for self-attention
-        causal_mask = self._make_causal_mask(dec_len, decoder_input.device)
+        # mask for self attn
+        causal_mask = self._make_causal_mask(total_len, full_input.device)
 
-        # Decode
-        decoded = self.decoder(
-            tgt=decoder_input,
-            memory=memory,
-            tgt_mask=causal_mask,
-        )  # (batch, dec_len, hidden_dim)
+        # decode
+        decoded = self.block(
+            full_input,
+            mask=causal_mask,
+        )  # (batch, total_len, hidden_dim)
 
-        # LM head
-        logits = self.lm_head(decoded)  # (batch, dec_len, vocab_size)
+        logits = self.lm_head(decoded[:, -dec_len:, :])  # (batch, dec_len, vocab_size)
 
         return logits
 
@@ -278,40 +276,35 @@ class AutoregressiveThinkingBlock(nn.Module):
         batch_size = chunk_hidden.shape[0]
         device = chunk_hidden.device
 
-        # Project memory once
-        memory = self.chunk_proj(chunk_hidden)
-
-        # Start with BOS
+        # start with BOS
         generated = torch.full((batch_size, 1), bos_id, dtype=torch.long, device=device)
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
         for step in range(max_len - 1):
             seq_len = generated.shape[1]
 
-            # Embed current sequence
-            positions = torch.arange(seq_len, device=device)
+            # embed
+            positions = torch.arange(seq_len, device=device) + self.chunk_size
             tok_emb = self.token_embedding(generated)
             pos_emb = self.position_embedding(positions)
             decoder_input = tok_emb + pos_emb
 
-            # Causal mask
-            causal_mask = self._make_causal_mask(seq_len, device)
+            # full context: prefix + generated tokens
+            full_input = torch.cat([chunk_hidden, decoder_input], dim=1)
+            total_len = full_input.shape[1]
+            causal_mask = self._make_causal_mask(total_len, device)
 
-            # Decode
-            decoded = self.decoder(
-                tgt=decoder_input,
-                memory=memory,
-                tgt_mask=causal_mask,
-            )
+            # decode
+            decoded = self.block(full_input, mask=causal_mask)
 
-            # Get next token logits from last position
+            # next token from last position
             next_logits = self.lm_head(decoded[:, -1, :])  # (batch, vocab_size)
             next_token = next_logits.argmax(dim=-1, keepdim=True)  # (batch, 1)
 
-            # Check for EOS
+            # check for EOS
             finished = finished | (next_token.squeeze(-1) == eos_id)
 
-            # Replace finished sequences' tokens with EOS (padding)
+            # pad finished sequences with EOS
             next_token = next_token.masked_fill(
                 finished.unsqueeze(-1) & (next_token != eos_id),
                 eos_id
@@ -329,8 +322,8 @@ class TransformerCompressionBlock(nn.Module):
     """
     Transformer-based compression of thought tokens into state tensor.
 
-    Uses a Transformer encoder to process thought tokens, then cross-attention
-    from learnable queries to produce a fixed-size state tensor.
+    Uses a causal Transformer block to process thought tokens, then takes the
+    last chunk_size hidden states as the compressed state.
 
     Input: thought token ids (batch, thought_len)
     Output: state tensor (batch, chunk_size, hidden_dim)
@@ -348,32 +341,22 @@ class TransformerCompressionBlock(nn.Module):
         self.hidden_dim = hidden_dim
         self.chunk_size = chunk_size
 
-        # Token and position embeddings
         self.embedding = nn.Embedding(vocab_size, hidden_dim)
         self.position_embedding = nn.Embedding(max_thought_len, hidden_dim)
 
-        # Transformer encoder
+        # this was tricky, we use the encoder layer bc we want causal self-attention
+        # in the paper this is described as a decoder block but we don't want cross attention
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=num_heads,
             dim_feedforward=hidden_dim * 4,
             batch_first=True,
         )
-        # Disable nested tensor path for better MPS compatibility
+        # mps needs us to disable nested tensor path
         self.encoder = nn.TransformerEncoder(
             encoder_layer,
             num_layers=1,
             enable_nested_tensor=False
-        )
-
-        # Learnable state queries
-        self.state_queries = nn.Parameter(torch.randn(1, chunk_size, hidden_dim) * 0.02)
-
-        # Cross-attention: queries attend to encoder output
-        self.cross_attention = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=num_heads,
-            batch_first=True,
         )
 
     def forward(
@@ -391,33 +374,38 @@ class TransformerCompressionBlock(nn.Module):
         """
         batch_size, seq_len = thought_ids.shape
 
-        # Embed tokens
+        # embeddingssss
         positions = torch.arange(seq_len, device=thought_ids.device)
         tok_emb = self.embedding(thought_ids)
         pos_emb = self.position_embedding(positions)
         embedded = tok_emb + pos_emb  # (batch, thought_len, hidden_dim)
 
-        # Build key_padding_mask for encoder (True = ignore)
+        # mask for self attn
+        causal_mask = torch.triu(
+            torch.ones(seq_len, seq_len, device=thought_ids.device, dtype=torch.float32),
+            diagonal=1
+        )
+        causal_mask = causal_mask.masked_fill(causal_mask == 1, float("-inf"))
+
+        # mask for padding
         src_key_padding_mask = None
         if attention_mask is not None:
             src_key_padding_mask = (attention_mask == 0)  # True where padded
 
-        # Encode
+        # encode
         encoded = self.encoder(
             embedded,
+            mask=causal_mask,
             src_key_padding_mask=src_key_padding_mask,
         )  # (batch, thought_len, hidden_dim)
 
-        # Expand learnable queries for batch
-        queries = self.state_queries.expand(batch_size, -1, -1)  # (batch, chunk_size, hidden_dim)
-
-        # Cross-attention from queries to encoded thoughts
-        state, _ = self.cross_attention(
-            query=queries,
-            key=encoded,
-            value=encoded,
-            key_padding_mask=src_key_padding_mask,
-        )  # (batch, chunk_size, hidden_dim)
+        # take last chunk_size states (pad on left if needed)
+        if seq_len >= self.chunk_size:
+            state = encoded[:, -self.chunk_size:, :]
+        else:
+            pad_len = self.chunk_size - seq_len
+            padding = torch.zeros(batch_size, pad_len, self.hidden_dim, device=encoded.device)
+            state = torch.cat([padding, encoded], dim=1)
 
         return state
 
