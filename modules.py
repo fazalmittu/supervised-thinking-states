@@ -5,6 +5,7 @@ import math
 import torch
 import torch.nn as nn
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
+from transformers.models.gpt2.modeling_gpt2 import GPT2Block, create_causal_mask
 
 from config import HIDDEN_DIM, CHUNK_SIZE, MAX_THOUGHT_LEN, GSM8K_CHUNK_SIZE, GSM8K_MAX_THOUGHT_LEN, DEVICE
 
@@ -174,6 +175,7 @@ class AutoregressiveThinkingBlock(nn.Module):
         max_thought_len: int = GSM8K_MAX_THOUGHT_LEN,
         num_heads: int = 8,
         chunk_size: int = GSM8K_CHUNK_SIZE,
+        gpt2_config=None,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -182,17 +184,13 @@ class AutoregressiveThinkingBlock(nn.Module):
         self.chunk_size = chunk_size
 
         self.token_embedding = nn.Embedding(vocab_size, hidden_dim)
-        self.position_embedding = nn.Embedding(max_thought_len, hidden_dim)
+        self.position_embedding = nn.Embedding(max_thought_len + chunk_size, hidden_dim)
 
         # same deal as compression block, encoder layer for causal self-attn without cross attention
-        block = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=num_heads,
-            dim_feedforward=hidden_dim * 4,
-            batch_first=True,
-        )
-        # mps needs us to disable nested tensor path
-        self.block = nn.TransformerEncoder(block, num_layers=1, enable_nested_tensor=False)
+        if gpt2_config is None:
+            raise ValueError("gpt2_config is required for AutoregressiveThinkingBlock")
+        self.gpt2_config = gpt2_config
+        self.block = GPT2Block(gpt2_config)
 
         self.lm_head = nn.Linear(hidden_dim, vocab_size)
 
@@ -235,16 +233,27 @@ class AutoregressiveThinkingBlock(nn.Module):
         # full context: prefix hidden states + thought tokens
         prefix = chunk_hidden  # (batch, chunk_size, hidden_dim)
         full_input = torch.cat([prefix, decoder_input], dim=1)  # (batch, chunk_size + dec_len, hidden_dim)
-        total_len = full_input.shape[1]
-
         # mask for self attn
-        causal_mask = self._make_causal_mask(total_len, full_input.device)
+        if target_mask is not None:
+            dec_mask = target_mask[:, :-1].to(full_input.device)
+        else:
+            dec_mask = torch.ones(batch_size, dec_len, device=full_input.device)
+        prefix_mask = torch.ones(batch_size, self.chunk_size, device=full_input.device)
+        attn_mask = torch.cat([prefix_mask, dec_mask], dim=1)
+        cache_position = torch.arange(full_input.shape[1], device=full_input.device)
+        causal_mask = create_causal_mask(
+            self.gpt2_config,
+            full_input,
+            attn_mask,
+            cache_position,
+            past_key_values=None,
+        )
 
         # decode
         decoded = self.block(
             full_input,
-            mask=causal_mask,
-        )  # (batch, total_len, hidden_dim)
+            attention_mask=causal_mask,
+        )[0]  # (batch, total_len, hidden_dim)
 
         logits = self.lm_head(decoded[:, -dec_len:, :])  # (batch, dec_len, vocab_size)
 
@@ -291,11 +300,18 @@ class AutoregressiveThinkingBlock(nn.Module):
 
             # full context: prefix + generated tokens
             full_input = torch.cat([chunk_hidden, decoder_input], dim=1)
-            total_len = full_input.shape[1]
-            causal_mask = self._make_causal_mask(total_len, device)
+            attn_mask = torch.ones(batch_size, full_input.shape[1], device=device)
+            cache_position = torch.arange(full_input.shape[1], device=device)
+            causal_mask = create_causal_mask(
+                self.gpt2_config,
+                full_input,
+                attn_mask,
+                cache_position,
+                past_key_values=None,
+            )
 
             # decode
-            decoded = self.block(full_input, mask=causal_mask)
+            decoded = self.block(full_input, attention_mask=causal_mask)[0]
 
             # next token from last position
             next_logits = self.lm_head(decoded[:, -1, :])  # (batch, vocab_size)
@@ -336,6 +352,7 @@ class TransformerCompressionBlock(nn.Module):
         chunk_size: int = GSM8K_CHUNK_SIZE,
         max_thought_len: int = GSM8K_MAX_THOUGHT_LEN,
         num_heads: int = 8,
+        gpt2_config=None,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -346,18 +363,10 @@ class TransformerCompressionBlock(nn.Module):
 
         # this was tricky, we use the encoder layer bc we want causal self-attention
         # in the paper this is described as a decoder block but we don't want cross attention
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=num_heads,
-            dim_feedforward=hidden_dim * 4,
-            batch_first=True,
-        )
-        # mps needs us to disable nested tensor path
-        self.encoder = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=1,
-            enable_nested_tensor=False
-        )
+        if gpt2_config is None:
+            raise ValueError("gpt2_config is required for TransformerCompressionBlock")
+        self.gpt2_config = gpt2_config
+        self.encoder = GPT2Block(gpt2_config)
 
     def forward(
         self,
@@ -380,24 +389,21 @@ class TransformerCompressionBlock(nn.Module):
         pos_emb = self.position_embedding(positions)
         embedded = tok_emb + pos_emb  # (batch, thought_len, hidden_dim)
 
-        # mask for self attn
-        causal_mask = torch.triu(
-            torch.ones(seq_len, seq_len, device=thought_ids.device, dtype=torch.float32),
-            diagonal=1
-        )
-        causal_mask = causal_mask.masked_fill(causal_mask == 1, float("-inf"))
-
         # mask for padding
-        src_key_padding_mask = None
         if attention_mask is not None:
-            src_key_padding_mask = (attention_mask == 0)  # True where padded
-
+            attn_mask = attention_mask.to(embedded.device)
+        else:
+            attn_mask = torch.ones(batch_size, seq_len, device=embedded.device)
         # encode
-        encoded = self.encoder(
+        cache_position = torch.arange(seq_len, device=embedded.device)
+        causal_mask = create_causal_mask(
+            self.gpt2_config,
             embedded,
-            mask=causal_mask,
-            src_key_padding_mask=src_key_padding_mask,
-        )  # (batch, thought_len, hidden_dim)
+            attn_mask,
+            cache_position,
+            past_key_values=None,
+        )
+        encoded = self.encoder(embedded, attention_mask=causal_mask)[0]  # (batch, thought_len, hidden_dim)
 
         # take last chunk_size states (pad on left if needed)
         if seq_len >= self.chunk_size:
@@ -433,7 +439,8 @@ if __name__ == "__main__":
 
     print("\n" + "="*50)
     print("Testing AutoregressiveThinkingBlock (GSM8K):")
-    ar_think = AutoregressiveThinkingBlock(vocab_size)
+    gpt2 = GPT2LMHeadModel.from_pretrained("gpt2")
+    ar_think = AutoregressiveThinkingBlock(vocab_size, gpt2_config=gpt2.config)
     hidden_gsm = torch.randn(2, GSM8K_CHUNK_SIZE, HIDDEN_DIM)
     target_gsm = torch.randint(0, vocab_size, (2, 10))
     logits_gsm = ar_think(hidden_gsm, target_gsm)
@@ -448,7 +455,7 @@ if __name__ == "__main__":
     print(f"Generated shape: {gen_ids.shape}")  # Should be (2, <=15)
 
     print("\nTesting TransformerCompressionBlock (GSM8K):")
-    tf_comp = TransformerCompressionBlock(vocab_size)
+    tf_comp = TransformerCompressionBlock(vocab_size, gpt2_config=gpt2.config)
     thought_ids_gsm = torch.randint(0, vocab_size, (2, 20))
     mask = torch.ones(2, 20)
     mask[1, 15:] = 0  # Simulate padding

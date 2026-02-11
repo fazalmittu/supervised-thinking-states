@@ -66,13 +66,16 @@ class ThinkingStatesModel(nn.Module):
                 hidden_dim=hidden_dim,
                 max_thought_len=GSM8K_MAX_THOUGHT_LEN,
                 chunk_size=self.chunk_size,
+                gpt2_config=self.backbone.config,
             )
             self.compression_block = TransformerCompressionBlock(
                 vocab_size,
                 hidden_dim=hidden_dim,
                 chunk_size=self.chunk_size,
                 max_thought_len=GSM8K_MAX_THOUGHT_LEN,
+                gpt2_config=self.backbone.config,
             )
+            self._init_gsm8k_modules_from_backbone()
         else:
             self.thinking_block = ThinkingBlock(vocab_size, hidden_dim)
             self.compression_block = CompressionBlock(vocab_size, hidden_dim, self.chunk_size)
@@ -86,6 +89,33 @@ class ThinkingStatesModel(nn.Module):
 
         # Register hooks
         self._register_hooks()
+
+    def _init_gsm8k_modules_from_backbone(self):
+        # init T from last layer of backbone
+        self.thinking_block.block.load_state_dict(self.backbone.transformer.h[-1].state_dict())
+
+        # init C from first layer of backbone
+        self.compression_block.encoder.load_state_dict(self.backbone.transformer.h[0].state_dict())
+
+        # share token embedding with backbone
+        self.thinking_block.token_embedding = self.backbone.transformer.wte
+        self.compression_block.embedding = self.backbone.transformer.wte
+
+        # init T unembedding from backbone
+        with torch.no_grad():
+            self.thinking_block.lm_head.weight.copy_(self.backbone.lm_head.weight)
+            if self.thinking_block.lm_head.bias is not None and self.backbone.lm_head.bias is not None:
+                self.thinking_block.lm_head.bias.copy_(self.backbone.lm_head.bias)
+
+        # init position embeddings from backbone (copy prefix)
+        with torch.no_grad():
+            t_pos = self.thinking_block.position_embedding.weight
+            c_pos = self.compression_block.position_embedding.weight
+            b_pos = self.backbone.transformer.wpe.weight
+            t_len = min(t_pos.shape[0], b_pos.shape[0])
+            c_len = min(c_pos.shape[0], b_pos.shape[0])
+            t_pos[:t_len].copy_(b_pos[:t_len])
+            c_pos[:c_len].copy_(b_pos[:c_len])
 
     def _register_hooks(self):
         """Register forward hooks for state injection and hidden extraction."""
