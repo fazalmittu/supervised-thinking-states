@@ -1,8 +1,11 @@
 """Training loop for Thinking States."""
 
+import math
+
 import torch
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 
 from config import (
@@ -19,9 +22,22 @@ from model import ThinkingStatesModel
 
 
 GRAD_ACCUM_STEPS = 4  # effective batch size = GSM8K_BATCH_SIZE * GRAD_ACCUM_STEPS
+WARMUP_RATIO = 0.03   # fraction of total optimizer steps used for linear warmup
 
 
-def train_epoch(model, dataloader, optimizer, device):
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps):
+    """Linear warmup then cosine decay to 0."""
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        progress = float(current_step - num_warmup_steps) / float(
+            max(1, num_training_steps - num_warmup_steps)
+        )
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    return LambdaLR(optimizer, lr_lambda)
+
+
+def train_epoch(model, dataloader, optimizer, device, scheduler=None):
     """Train for one epoch. Loss = L_LM + L_T (paper Eq. 6, equal weighting).
 
     Uses gradient accumulation to maintain a larger effective batch size
@@ -71,6 +87,8 @@ def train_epoch(model, dataloader, optimizer, device):
                 [p for p in model.parameters() if p.requires_grad], max_norm=1.0
             )
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
             optimizer.zero_grad()
 
         # Free MPS cache periodically to prevent OOM buildup
@@ -200,15 +218,23 @@ def main():
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = AdamW(trainable_params, lr=learning_rate)
 
+    # LR scheduler: linear warmup (3% of steps) + cosine decay
+    steps_per_epoch = (len(train_loader) + GRAD_ACCUM_STEPS - 1) // GRAD_ACCUM_STEPS
+    total_opt_steps = steps_per_epoch * num_epochs
+    warmup_steps = int(total_opt_steps * WARMUP_RATIO)
+    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_opt_steps)
+
     # Training loop
     eff_bs = batch_size * GRAD_ACCUM_STEPS
     print(f"\nStarting training: {num_epochs} epochs, "
           f"batch_size={batch_size} x {GRAD_ACCUM_STEPS} accum = {eff_bs} effective, "
           f"lr={learning_rate}")
+    print(f"LR schedule: {warmup_steps} warmup steps, "
+          f"{total_opt_steps} total optimizer steps (cosine decay)")
     for epoch in range(num_epochs):
         print(f"\nEpoch {epoch + 1}/{num_epochs}")
 
-        train_metrics = train_epoch(model, train_loader, optimizer, DEVICE)
+        train_metrics = train_epoch(model, train_loader, optimizer, DEVICE, scheduler)
         print(f"Train - LM Loss: {train_metrics['lm_loss']:.4f}, "
               f"Think Loss: {train_metrics['think_loss']:.4f}")
 

@@ -4,31 +4,39 @@ Supports both GPT-2 and Qwen2.5 backbones. The correct decoder layer type and
 causal mask function are selected based on the backbone model name.
 """
 
-import math
-
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from config import HIDDEN_DIM, CHUNK_SIZE, MAX_THOUGHT_LEN, GSM8K_CHUNK_SIZE, GSM8K_MAX_THOUGHT_LEN, DEVICE
+from utils import is_gpt2
 
 
 # ---------------------------------------------------------------------------
 # Helpers for backbone-agnostic layer creation
 # ---------------------------------------------------------------------------
 
-def _is_gpt2(model_name: str) -> bool:
-    return "gpt2" in model_name.lower()
-
 
 def _make_decoder_layer(backbone_config, model_name: str, layer_idx: int = 0):
     """Create one decoder layer matching the backbone architecture."""
-    if _is_gpt2(model_name):
+    if is_gpt2(model_name):
         from transformers.models.gpt2.modeling_gpt2 import GPT2Block
         return GPT2Block(backbone_config)
     else:
         from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
         return Qwen2DecoderLayer(backbone_config, layer_idx=layer_idx)
+
+
+# Cache for Qwen2RotaryEmbedding instances to avoid re-creating per call.
+_rotary_cache: dict = {}
+
+
+def _get_rotary_embedding(backbone_config, device):
+    """Return a cached Qwen2RotaryEmbedding for the given config and device."""
+    key = (id(backbone_config), str(device))
+    if key not in _rotary_cache:
+        from transformers.models.qwen2.modeling_qwen2 import Qwen2RotaryEmbedding
+        _rotary_cache[key] = Qwen2RotaryEmbedding(config=backbone_config, device=device)
+    return _rotary_cache[key]
 
 
 def _run_decoder_layer(layer, hidden_states, attention_mask, model_name: str,
@@ -41,7 +49,7 @@ def _run_decoder_layer(layer, hidden_states, attention_mask, model_name: str,
     device = hidden_states.device
     batch_size, seq_len, _ = hidden_states.shape
 
-    if _is_gpt2(model_name):
+    if is_gpt2(model_name):
         from transformers.models.gpt2.modeling_gpt2 import create_causal_mask
         if attention_mask is None:
             attention_mask = torch.ones(batch_size, seq_len, device=device)
@@ -55,13 +63,12 @@ def _run_decoder_layer(layer, hidden_states, attention_mask, model_name: str,
     else:
         # Qwen2DecoderLayer expects: hidden_states, attention_mask, position_ids,
         #   position_embeddings, ...
-        from transformers.models.qwen2.modeling_qwen2 import Qwen2RotaryEmbedding
         from transformers.masking_utils import create_causal_mask
 
         position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
 
-        # Build RoPE embeddings
-        rotary = Qwen2RotaryEmbedding(config=backbone_config, device=device)
+        # Build RoPE embeddings (cached to avoid re-instantiation every call)
+        rotary = _get_rotary_embedding(backbone_config, device)
         position_embeddings = rotary(hidden_states, position_ids)
 
         # Build causal mask  (Qwen2 uses the generic create_causal_mask)
@@ -157,7 +164,6 @@ class AutoregressiveThinkingBlock(nn.Module):
         vocab_size: int,
         hidden_dim: int = HIDDEN_DIM,
         max_thought_len: int = GSM8K_MAX_THOUGHT_LEN,
-        num_heads: int = 8,
         chunk_size: int = GSM8K_CHUNK_SIZE,
         backbone_config=None,
         model_name: str = "gpt2",
@@ -257,7 +263,6 @@ class TransformerCompressionBlock(nn.Module):
         hidden_dim: int = HIDDEN_DIM,
         chunk_size: int = GSM8K_CHUNK_SIZE,
         max_thought_len: int = GSM8K_MAX_THOUGHT_LEN,
-        num_heads: int = 8,
         backbone_config=None,
         model_name: str = "gpt2",
         pad_token_id: int = None,
@@ -337,7 +342,7 @@ if __name__ == "__main__":
     print("\nTesting AutoregressiveThinkingBlock (GPT-2):")
     gpt2 = GPT2LMHeadModel.from_pretrained("gpt2")
     ar_think = AutoregressiveThinkingBlock(
-        vocab_size, gpt2_config=None, backbone_config=gpt2.config, model_name="gpt2"
+        vocab_size, backbone_config=gpt2.config, model_name="gpt2"
     )
     ar_think.token_embedding = gpt2.transformer.wte
     hidden_gsm = torch.randn(2, GSM8K_CHUNK_SIZE, HIDDEN_DIM)

@@ -22,7 +22,6 @@ Usage:
 """
 
 import argparse
-import re
 import time
 
 import torch
@@ -33,74 +32,7 @@ from config import DEVICE, MODEL_NAME, GSM8K_MAX_ANSWER_TOKENS, BOS_TOKEN, EOS_T
 from data import GSM8KDataset
 from model import ThinkingStatesModel
 from inference import ThinkingStatesInference
-
-
-# ---------------------------------------------------------------------------
-# Answer extraction (shared by all eval modes)
-# ---------------------------------------------------------------------------
-
-def extract_number(text: str) -> str | None:
-    """Extract the final answer number from generated text.
-
-    Strategy (in priority order):
-    1. "the answer is <number>"
-    2. "#### <number>" (GSM8K gold format)
-    3. Standalone number on its own line
-    4. Number at the very start of the output (answer-first pattern)
-    5. Last "= <number>" (computation result)
-    6. First number if output starts with a digit
-    7. Last number as fallback
-    """
-    text = text.strip()
-
-    # 1: explicit "answer is" phrasing
-    m = re.search(r'(?:the answer is|answer is|answer:)\s*\$?(-?[\d,]+\.?\d*)', text, re.IGNORECASE)
-    if m:
-        return m.group(1).replace(',', '')
-
-    # 2: "#### <number>"
-    m = re.search(r'####\s*(-?[\d,]+\.?\d*)', text)
-    if m:
-        return m.group(1).replace(',', '')
-
-    # 3: standalone number on its own line
-    for line in text.split('\n'):
-        line = line.strip()
-        if re.fullmatch(r'\$?-?[\d,]+\.?\d*', line):
-            return line.lstrip('$').replace(',', '')
-
-    # 4: answer-first pattern ("42\nExplanation: ...")
-    m = re.match(r'\$?(-?[\d,]+\.?\d*)\s*\n', text)
-    if m:
-        return m.group(1).replace(',', '')
-
-    # 5: last "= <number>"
-    equals_matches = re.findall(r'=\s*\$?(-?[\d,]+\.?\d*)', text)
-    if equals_matches:
-        return equals_matches[-1].replace(',', '')
-
-    # 6: starts with a digit
-    m = re.match(r'\$?(-?[\d,]+\.?\d*)', text)
-    if m:
-        return m.group(1).replace(',', '')
-
-    # 7: last number
-    matches = re.findall(r'-?[\d,]+\.?\d*', text)
-    if matches:
-        return matches[-1].replace(',', '')
-    return None
-
-
-def answers_match(predicted: str, gold: str) -> bool:
-    """Check if predicted answer matches gold numerically."""
-    pred_num = extract_number(predicted)
-    gold_num = extract_number(gold)
-    if pred_num is None or gold_num is None:
-        return False
-    try:
-        return float(pred_num) == float(gold_num)
-    except ValueError:
-        return pred_num == gold_num
+from utils import extract_number, answers_match
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +121,11 @@ def evaluate(limit=None, verbose=False, show_samples=10, skip_fewshot=False):
     ts_model = ThinkingStatesModel()
     try:
         state_dict = torch.load("thinking_states_model.pt", map_location="cpu")
-        ts_model.load_state_dict(state_dict)
+        missing, unexpected = ts_model.load_state_dict(state_dict, strict=False)
+        if unexpected:
+            print(f"  (ignored unexpected keys: {unexpected})")
+        if missing:
+            print(f"  (missing keys: {missing})")
         print("  Loaded trained weights.")
     except FileNotFoundError:
         print("  WARNING: No trained weights found! Using untrained model.")
@@ -201,7 +137,7 @@ def evaluate(limit=None, verbose=False, show_samples=10, skip_fewshot=False):
     print(f"Loading vanilla {MODEL_NAME}...")
     load_kwargs = {}
     if "qwen" in MODEL_NAME.lower():
-        load_kwargs["torch_dtype"] = torch.bfloat16
+        load_kwargs["dtype"] = torch.bfloat16
         load_kwargs["trust_remote_code"] = True
     vanilla_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, **load_kwargs)
     vanilla_tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)

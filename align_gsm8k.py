@@ -16,7 +16,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from datasets import load_dataset
-from transformers import GPT2Tokenizer
+from transformers import AutoTokenizer
 
 from config import GSM8K_CACHE_DIR, GSM8K_CHUNK_SIZE, TEACHER_MODEL, MODEL_NAME
 
@@ -247,7 +247,7 @@ async def align_dataset(
 ):
     """Align a GSM8K split using async concurrent Gemini calls."""
     if tokenizer is None:
-        tokenizer = GPT2Tokenizer.from_pretrained(MODEL_NAME)
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
 
     cache_dir = Path(GSM8K_CACHE_DIR)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -459,7 +459,7 @@ if __name__ == "__main__":
                         choices=["train", "test", "both"])
     args = parser.parse_args()
 
-    tokenizer = GPT2Tokenizer.from_pretrained(MODEL_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
 
     if args.test_only:
         test_single_example(tokenizer)

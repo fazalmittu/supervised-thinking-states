@@ -17,16 +17,7 @@ from modules import (
     ThinkingBlock, CompressionBlock,
     AutoregressiveThinkingBlock, TransformerCompressionBlock
 )
-
-
-def _is_qwen(model_name: str) -> bool:
-    """Check if model_name refers to a Qwen model."""
-    return "qwen" in model_name.lower()
-
-
-def _is_gpt2(model_name: str) -> bool:
-    """Check if model_name refers to a GPT-2 model."""
-    return "gpt2" in model_name.lower()
+from utils import is_gpt2, is_qwen
 
 
 class ThinkingStatesModel(nn.Module):
@@ -58,8 +49,8 @@ class ThinkingStatesModel(nn.Module):
         # Load backbone and tokenizer
         # ------------------------------------------------------------------
         load_kwargs = {}
-        if _is_qwen(model_name):
-            load_kwargs["torch_dtype"] = torch.bfloat16
+        if is_qwen(model_name):
+            load_kwargs["dtype"] = torch.bfloat16
             load_kwargs["trust_remote_code"] = True
 
         self.backbone = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
@@ -149,7 +140,7 @@ class ThinkingStatesModel(nn.Module):
 
     def _get_layers(self):
         """Return the nn.ModuleList of transformer layers."""
-        if _is_gpt2(self.model_name):
+        if is_gpt2(self.model_name):
             return self.backbone.transformer.h
         else:
             # Qwen2, LLaMA, Mistral, etc.
@@ -157,7 +148,7 @@ class ThinkingStatesModel(nn.Module):
 
     def _get_embed_tokens(self):
         """Return the token embedding module."""
-        if _is_gpt2(self.model_name):
+        if is_gpt2(self.model_name):
             return self.backbone.transformer.wte
         else:
             return self.backbone.model.embed_tokens
