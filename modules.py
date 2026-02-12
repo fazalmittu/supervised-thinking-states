@@ -183,10 +183,14 @@ class AutoregressiveThinkingBlock(nn.Module):
         self.vocab_size = vocab_size
         self.chunk_size = chunk_size
 
-        self.token_embedding = nn.Embedding(vocab_size, hidden_dim)
-        self.position_embedding = nn.Embedding(max_thought_len + chunk_size, hidden_dim)
+        # Token embedding is shared with backbone (set in model.py _init_gsm8k_modules_from_backbone).
+        # We declare it here so the attribute exists; it gets overwritten with the backbone's wte.
+        self.token_embedding = None
 
-        # same deal as compression block, encoder layer for causal self-attn without cross attention
+        # No position embeddings: per the paper, T is a single Transformer block
+        # matching a backbone layer. The prefix H_out already encodes positional
+        # information from the backbone's forward pass.
+
         if gpt2_config is None:
             raise ValueError("gpt2_config is required for AutoregressiveThinkingBlock")
         self.gpt2_config = gpt2_config
@@ -224,11 +228,8 @@ class AutoregressiveThinkingBlock(nn.Module):
         decoder_input_ids = target_ids[:, :-1]  # (batch, thought_len-1)
         batch_size, dec_len = decoder_input_ids.shape
 
-        # embed decoder input
-        positions = torch.arange(dec_len, device=decoder_input_ids.device) + self.chunk_size
-        tok_emb = self.token_embedding(decoder_input_ids)
-        pos_emb = self.position_embedding(positions)
-        decoder_input = tok_emb + pos_emb  # (batch, dec_len, hidden_dim)
+        # Embed decoder input (no position embeddings per paper)
+        decoder_input = self.token_embedding(decoder_input_ids)  # (batch, dec_len, hidden_dim)
 
         # full context: prefix hidden states + thought tokens
         prefix = chunk_hidden  # (batch, chunk_size, hidden_dim)
@@ -292,11 +293,8 @@ class AutoregressiveThinkingBlock(nn.Module):
         for step in range(max_len - 1):
             seq_len = generated.shape[1]
 
-            # embed
-            positions = torch.arange(seq_len, device=device) + self.chunk_size
-            tok_emb = self.token_embedding(generated)
-            pos_emb = self.position_embedding(positions)
-            decoder_input = tok_emb + pos_emb
+            # Embed (no position embeddings per paper)
+            decoder_input = self.token_embedding(generated)
 
             # full context: prefix + generated tokens
             full_input = torch.cat([chunk_hidden, decoder_input], dim=1)
@@ -353,16 +351,20 @@ class TransformerCompressionBlock(nn.Module):
         max_thought_len: int = GSM8K_MAX_THOUGHT_LEN,
         num_heads: int = 8,
         gpt2_config=None,
+        pad_token_id: int = None,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.chunk_size = chunk_size
+        self.pad_token_id = pad_token_id
 
-        self.embedding = nn.Embedding(vocab_size, hidden_dim)
-        self.position_embedding = nn.Embedding(max_thought_len, hidden_dim)
+        # Token embedding shared with backbone (set in model.py _init_gsm8k_modules_from_backbone).
+        self.embedding = None
 
-        # this was tricky, we use the encoder layer bc we want causal self-attention
-        # in the paper this is described as a decoder block but we don't want cross attention
+        # No position embeddings: per the paper, C is a single Transformer block
+        # matching the first backbone layer. It contextualizes token embeddings
+        # directly without adding its own positional information.
+
         if gpt2_config is None:
             raise ValueError("gpt2_config is required for TransformerCompressionBlock")
         self.gpt2_config = gpt2_config
@@ -382,19 +384,37 @@ class TransformerCompressionBlock(nn.Module):
             state: (batch, chunk_size, hidden_dim)
         """
         batch_size, seq_len = thought_ids.shape
+        device = thought_ids.device
 
-        # embeddingssss
-        positions = torch.arange(seq_len, device=thought_ids.device)
-        tok_emb = self.embedding(thought_ids)
-        pos_emb = self.position_embedding(positions)
-        embedded = tok_emb + pos_emb  # (batch, thought_len, hidden_dim)
+        # Per paper (Appendix A.1): if input is shorter than chunk_size, pad the
+        # input token sequence with padding tokens *before* encoding, so the
+        # Transformer block processes them and produces meaningful representations.
+        if seq_len < self.chunk_size:
+            pad_len = self.chunk_size - seq_len
+            pad_id = self.pad_token_id if self.pad_token_id is not None else 0
+            pad_tokens = torch.full((batch_size, pad_len), pad_id, dtype=torch.long, device=device)
+            thought_ids = torch.cat([thought_ids, pad_tokens], dim=1)
+            # Extend attention mask: 0 for padding positions
+            if attention_mask is not None:
+                pad_mask = torch.zeros(batch_size, pad_len, device=device)
+                attention_mask = torch.cat([attention_mask, pad_mask], dim=1)
+            else:
+                attention_mask = torch.cat([
+                    torch.ones(batch_size, seq_len, device=device),
+                    torch.zeros(batch_size, pad_len, device=device),
+                ], dim=1)
+            seq_len = thought_ids.shape[1]
 
-        # mask for padding
+        # Embed tokens (no position embeddings per paper)
+        embedded = self.embedding(thought_ids)  # (batch, seq_len, hidden_dim)
+
+        # Build attention mask
         if attention_mask is not None:
             attn_mask = attention_mask.to(embedded.device)
         else:
             attn_mask = torch.ones(batch_size, seq_len, device=embedded.device)
-        # encode
+
+        # Encode with causal attention
         cache_position = torch.arange(seq_len, device=embedded.device)
         causal_mask = create_causal_mask(
             self.gpt2_config,
@@ -403,15 +423,10 @@ class TransformerCompressionBlock(nn.Module):
             cache_position,
             past_key_values=None,
         )
-        encoded = self.encoder(embedded, attention_mask=causal_mask)[0]  # (batch, thought_len, hidden_dim)
+        encoded = self.encoder(embedded, attention_mask=causal_mask)[0]  # (batch, seq_len, hidden_dim)
 
-        # take last chunk_size states (pad on left if needed)
-        if seq_len >= self.chunk_size:
-            state = encoded[:, -self.chunk_size:, :]
-        else:
-            pad_len = self.chunk_size - seq_len
-            padding = torch.zeros(batch_size, pad_len, self.hidden_dim, device=encoded.device)
-            state = torch.cat([padding, encoded], dim=1)
+        # Take last chunk_size states as the compressed state
+        state = encoded[:, -self.chunk_size:, :]
 
         return state
 
@@ -441,6 +456,8 @@ if __name__ == "__main__":
     print("Testing AutoregressiveThinkingBlock (GSM8K):")
     gpt2 = GPT2LMHeadModel.from_pretrained("gpt2")
     ar_think = AutoregressiveThinkingBlock(vocab_size, gpt2_config=gpt2.config)
+    # Must set token_embedding before use (normally done by model.py)
+    ar_think.token_embedding = gpt2.transformer.wte
     hidden_gsm = torch.randn(2, GSM8K_CHUNK_SIZE, HIDDEN_DIM)
     target_gsm = torch.randint(0, vocab_size, (2, 10))
     logits_gsm = ar_think(hidden_gsm, target_gsm)
@@ -455,10 +472,21 @@ if __name__ == "__main__":
     print(f"Generated shape: {gen_ids.shape}")  # Should be (2, <=15)
 
     print("\nTesting TransformerCompressionBlock (GSM8K):")
-    tf_comp = TransformerCompressionBlock(vocab_size, gpt2_config=gpt2.config)
+    tf_comp = TransformerCompressionBlock(
+        vocab_size, gpt2_config=gpt2.config, pad_token_id=tokenizer.eos_token_id
+    )
+    # Must set embedding before use (normally done by model.py)
+    tf_comp.embedding = gpt2.transformer.wte
     thought_ids_gsm = torch.randint(0, vocab_size, (2, 20))
     mask = torch.ones(2, 20)
     mask[1, 15:] = 0  # Simulate padding
     state_gsm = tf_comp(thought_ids_gsm, attention_mask=mask)
     print(f"Input shape: {thought_ids_gsm.shape}")
     print(f"Output shape: {state_gsm.shape}")  # Should be (2, GSM8K_CHUNK_SIZE, HIDDEN_DIM)
+
+    print("\nTesting TransformerCompressionBlock short input padding:")
+    short_ids = torch.randint(0, vocab_size, (2, 4))  # shorter than chunk_size
+    short_mask = torch.ones(2, 4)
+    state_short = tf_comp(short_ids, attention_mask=short_mask)
+    print(f"Short input shape: {short_ids.shape}")
+    print(f"Output shape: {state_short.shape}")  # Should be (2, GSM8K_CHUNK_SIZE, HIDDEN_DIM)

@@ -7,8 +7,8 @@ from tqdm import tqdm
 
 from config import (
     DEVICE, BATCH_SIZE, NUM_EPOCHS, LEARNING_RATE,
-    LAMBDA_THINK, TRAIN_SIZE, VAL_SIZE, MIN_FLIPS, MAX_FLIPS,
-    GSM8K_BATCH_SIZE, GSM8K_NUM_EPOCHS, GSM8K_LEARNING_RATE, GSM8K_LAMBDA_THINK,
+    TRAIN_SIZE, VAL_SIZE, MIN_FLIPS, MAX_FLIPS,
+    GSM8K_BATCH_SIZE, GSM8K_NUM_EPOCHS, GSM8K_LEARNING_RATE,
     TASK
 )
 from data import (
@@ -18,8 +18,8 @@ from data import (
 from model import ThinkingStatesModel
 
 
-def train_epoch(model, dataloader, optimizer, device, lambda_think):
-    """Train for one epoch."""
+def train_epoch(model, dataloader, optimizer, device):
+    """Train for one epoch. Loss = L_LM + L_T (paper Eq. 6, equal weighting)."""
     model.train()
     total_lm_loss = 0.0
     total_think_loss = 0.0
@@ -45,10 +45,10 @@ def train_epoch(model, dataloader, optimizer, device, lambda_think):
         lm_loss = outputs["lm_loss"]
         think_loss = outputs["thinking_loss"]
 
-        # Combined loss
+        # Combined loss: L = L_LM + L_T (paper Eq. 6)
         loss = lm_loss
         if think_loss is not None:
-            loss = loss + lambda_think * think_loss
+            loss = loss + think_loss
 
         loss.backward()
         optimizer.step()
@@ -97,8 +97,11 @@ def evaluate(model, dataloader, device):
                 total_think_loss += think_loss.item()
             num_batches += 1
 
-            # Check accuracy - run forward again to get logits with state injection
-            # The model.forward() sets up the injection hooks
+            # Get logits from the forward pass that already ran with state injection.
+            # model.forward() calls backbone with output_hidden_states=True, which
+            # returns logits. We re-run backbone here because model.forward() doesn't
+            # expose logits directly (it only returns lm_loss). This is the same
+            # state-injected pass since we rebuild the state tensor identically.
             model._state_to_inject = model.build_state_tensor(
                 chunk_thought_ids, input_ids.shape[1], input_ids.shape[0], chunk_thought_masks
             )
@@ -110,10 +113,10 @@ def evaluate(model, dataloader, device):
             for i in range(input_ids.shape[0]):
                 answer_mask = labels[i] != -100
                 if answer_mask.any():
-                    answer_positions = answer_mask.nonzero().squeeze(-1)
+                    answer_positions = answer_mask.nonzero(as_tuple=False).view(-1)
                     preds = logits[i, answer_positions - 1].argmax(dim=-1)
                     trues = labels[i, answer_positions]
-                    if torch.equal(preds, trues):
+                    if preds.shape == trues.shape and torch.equal(preds, trues):
                         correct += 1
                     total += 1
 
@@ -143,7 +146,6 @@ def main():
         batch_size = GSM8K_BATCH_SIZE
         num_epochs = GSM8K_NUM_EPOCHS
         learning_rate = GSM8K_LEARNING_RATE
-        lambda_think = GSM8K_LAMBDA_THINK
     else:
         train_dataset = ParityDataset(TRAIN_SIZE, MIN_FLIPS, MAX_FLIPS, tokenizer)
         val_dataset = ParityDataset(VAL_SIZE, MIN_FLIPS, MAX_FLIPS, tokenizer)
@@ -151,7 +153,6 @@ def main():
         batch_size = BATCH_SIZE
         num_epochs = NUM_EPOCHS
         learning_rate = LEARNING_RATE
-        lambda_think = LAMBDA_THINK
 
     train_loader = DataLoader(
         train_dataset,
@@ -174,7 +175,7 @@ def main():
     for epoch in range(num_epochs):
         print(f"\nEpoch {epoch + 1}/{num_epochs}")
 
-        train_metrics = train_epoch(model, train_loader, optimizer, DEVICE, lambda_think)
+        train_metrics = train_epoch(model, train_loader, optimizer, DEVICE)
         print(f"Train - LM Loss: {train_metrics['lm_loss']:.4f}, "
               f"Think Loss: {train_metrics['think_loss']:.4f}")
 

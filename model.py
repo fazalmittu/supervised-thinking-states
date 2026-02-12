@@ -74,14 +74,12 @@ class ThinkingStatesModel(nn.Module):
                 chunk_size=self.chunk_size,
                 max_thought_len=GSM8K_MAX_THOUGHT_LEN,
                 gpt2_config=self.backbone.config,
+                pad_token_id=self.tokenizer.pad_token_id,
             )
             self._init_gsm8k_modules_from_backbone()
         else:
             self.thinking_block = ThinkingBlock(vocab_size, hidden_dim)
             self.compression_block = CompressionBlock(vocab_size, hidden_dim, self.chunk_size)
-
-        # Learnable gate for injection (init to 0 for stability)
-        self.injection_gate = nn.Parameter(torch.zeros(1))
 
         # State to inject (set during forward)
         self._state_to_inject = None
@@ -91,46 +89,35 @@ class ThinkingStatesModel(nn.Module):
         self._register_hooks()
 
     def _init_gsm8k_modules_from_backbone(self):
-        # init T from last layer of backbone
+        # init T from last layer of backbone (paper Appendix A.1)
         self.thinking_block.block.load_state_dict(self.backbone.transformer.h[-1].state_dict())
 
-        # init C from first layer of backbone
+        # init C from first layer of backbone (paper Appendix A.1)
         self.compression_block.encoder.load_state_dict(self.backbone.transformer.h[0].state_dict())
 
-        # share token embedding with backbone
+        # Share token embedding with backbone (paper: "embedding layer is shared with Mθ")
         self.thinking_block.token_embedding = self.backbone.transformer.wte
         self.compression_block.embedding = self.backbone.transformer.wte
 
-        # init T unembedding from backbone
+        # Init T unembedding from backbone (paper: "independent copy")
         with torch.no_grad():
             self.thinking_block.lm_head.weight.copy_(self.backbone.lm_head.weight)
             if self.thinking_block.lm_head.bias is not None and self.backbone.lm_head.bias is not None:
                 self.thinking_block.lm_head.bias.copy_(self.backbone.lm_head.bias)
 
-        # init position embeddings from backbone (copy prefix)
-        with torch.no_grad():
-            t_pos = self.thinking_block.position_embedding.weight
-            c_pos = self.compression_block.position_embedding.weight
-            b_pos = self.backbone.transformer.wpe.weight
-            t_len = min(t_pos.shape[0], b_pos.shape[0])
-            c_len = min(c_pos.shape[0], b_pos.shape[0])
-            t_pos[:t_len].copy_(b_pos[:t_len])
-            c_pos[:c_len].copy_(b_pos[:c_len])
-
     def _register_hooks(self):
         """Register forward hooks for state injection and hidden extraction."""
 
         def injection_hook(module, input, output):
-            """Inject state at layer L_IN."""
+            """Inject state at layer L_IN via direct addition (paper Eq. 1: X̃_i = X_i + S_i)."""
             if self._state_to_inject is not None:
                 # output is a tuple: (hidden_states, ...) or just hidden_states
                 if isinstance(output, tuple):
                     hidden = output[0]
-                    # Inject state
-                    hidden = hidden + self.injection_gate * self._state_to_inject
+                    hidden = hidden + self._state_to_inject
                     return (hidden,) + output[1:]
                 else:
-                    return output + self.injection_gate * self._state_to_inject
+                    return output + self._state_to_inject
             return output
 
         def extraction_hook(module, input, output):
@@ -158,8 +145,13 @@ class ThinkingStatesModel(nn.Module):
         """
         Build the full state tensor from per-chunk thought ids.
 
+        Per the paper (Eq. 1, 4, 5): S_1 = 0 (first chunk gets zero state),
+        and S_{i+1} = C(Z*_i) -- the thought from chunk i is compressed and
+        injected into chunk i+1's token positions.
+
         Args:
-            chunk_thought_ids: List of (batch, thought_len) tensors, one per chunk
+            chunk_thought_ids: List of (batch, thought_len) tensors, one per chunk.
+                               chunk_thought_ids[i] contains the thought target for chunk i.
             seq_len: Total sequence length
             batch_size: Batch size
 
@@ -172,6 +164,13 @@ class ThinkingStatesModel(nn.Module):
         num_chunks = len(chunk_thought_ids)
 
         for chunk_idx, thought_ids in enumerate(chunk_thought_ids):
+            # The thought from chunk_idx is injected into chunk_idx + 1.
+            # chunk 0's thought -> injected into chunk 1's positions
+            # chunk K-1's thought -> would go into chunk K (beyond input), so skip.
+            target_chunk = chunk_idx + 1
+            if target_chunk >= num_chunks:
+                break
+
             # Compress thoughts to state
             thought_ids = thought_ids.to(device)
             if chunk_thought_masks is not None:
@@ -180,9 +179,11 @@ class ThinkingStatesModel(nn.Module):
             else:
                 chunk_state = self.compression_block(thought_ids)  # (batch, chunk_size, hidden_dim)
 
-            # Place in state tensor at correct positions
-            start_pos = chunk_idx * self.chunk_size
+            # Place in state tensor at the *next* chunk's positions
+            start_pos = target_chunk * self.chunk_size
             end_pos = min(start_pos + self.chunk_size, seq_len)
+            if start_pos >= seq_len:
+                break
             actual_len = end_pos - start_pos
 
             state_tensor[:, start_pos:end_pos, :] = chunk_state[:, :actual_len, :]
@@ -338,7 +339,6 @@ if __name__ == "__main__":
     model.to(DEVICE)
 
     print(f"Model loaded on {DEVICE}")
-    print(f"Injection gate value: {model.injection_gate.item()}")
 
     # Test forward pass
     tokenizer = model.tokenizer
