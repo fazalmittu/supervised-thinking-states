@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import List, Tuple, Dict
 import torch
 from torch.utils.data import Dataset
-from transformers import GPT2Tokenizer
+from transformers import PreTrainedTokenizer
 
 from config import (
     CHUNK_SIZE, MIN_FLIPS, MAX_FLIPS,
@@ -17,7 +17,7 @@ from config import (
 def generate_parity_example(
     num_flips: int,
     chunk_size: int = CHUNK_SIZE,
-    tokenizer: GPT2Tokenizer = None
+    tokenizer: PreTrainedTokenizer = None
 ) -> Dict:
     """
     Generate a single parity task example.
@@ -46,7 +46,8 @@ def generate_parity_example(
     # Now we need to assign thoughts to chunks based on token positions
     # Tokenize to get token positions
     if tokenizer is None:
-        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
 
     tokens = tokenizer.encode(input_text, add_special_tokens=False)
     num_tokens = len(tokens)
@@ -99,12 +100,15 @@ class ParityDataset(Dataset):
         size: int,
         min_flips: int = MIN_FLIPS,
         max_flips: int = MAX_FLIPS,
-        tokenizer: GPT2Tokenizer = None
+        tokenizer: PreTrainedTokenizer = None
     ):
         self.size = size
         self.min_flips = min_flips
         self.max_flips = max_flips
-        self.tokenizer = tokenizer or GPT2Tokenizer.from_pretrained("gpt2")
+        if tokenizer is None:
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        self.tokenizer = tokenizer
 
         # Pre-generate examples
         self.examples = []
@@ -120,7 +124,7 @@ class ParityDataset(Dataset):
         return self.examples[idx]
 
 
-def collate_fn(batch: List[Dict], tokenizer: GPT2Tokenizer) -> Dict:
+def collate_fn(batch: List[Dict], tokenizer: PreTrainedTokenizer) -> Dict:
     """
     Collate function for DataLoader.
 
@@ -184,7 +188,7 @@ def collate_fn(batch: List[Dict], tokenizer: GPT2Tokenizer) -> Dict:
     }
 
 
-def get_collate_fn(tokenizer: GPT2Tokenizer):
+def get_collate_fn(tokenizer: PreTrainedTokenizer):
     """Returns a collate function with the tokenizer bound."""
     def _collate(batch):
         return collate_fn(batch, tokenizer)
@@ -198,13 +202,16 @@ class GSM8KDataset(Dataset):
         self,
         split: str = "train",
         cache_dir: str = GSM8K_CACHE_DIR,
-        tokenizer: GPT2Tokenizer = None,
+        tokenizer: PreTrainedTokenizer = None,
         limit: int = None,
         aligned_suffix: str = GSM8K_ALIGNED_SUFFIX
     ):
         self.split = split
         self.cache_dir = Path(cache_dir)
-        self.tokenizer = tokenizer or GPT2Tokenizer.from_pretrained("gpt2")
+        if tokenizer is None:
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        self.tokenizer = tokenizer
         self.aligned_suffix = aligned_suffix
 
         path = self.cache_dir / f"{split}_aligned{self.aligned_suffix}.jsonl"
@@ -229,7 +236,7 @@ class GSM8KDataset(Dataset):
         return self.examples[idx]
 
 
-def gsm8k_collate_fn(batch: List[Dict], tokenizer: GPT2Tokenizer) -> Dict:
+def gsm8k_collate_fn(batch: List[Dict], tokenizer: PreTrainedTokenizer) -> Dict:
     """
     Collate function for GSM8K DataLoader.
 
@@ -319,7 +326,7 @@ def gsm8k_collate_fn(batch: List[Dict], tokenizer: GPT2Tokenizer) -> Dict:
     }
 
 
-def get_gsm8k_collate_fn(tokenizer: GPT2Tokenizer):
+def get_gsm8k_collate_fn(tokenizer: PreTrainedTokenizer):
     """Returns a GSM8K collate function with the tokenizer bound."""
     def _collate(batch):
         return gsm8k_collate_fn(batch, tokenizer)
@@ -328,7 +335,8 @@ def get_gsm8k_collate_fn(tokenizer: GPT2Tokenizer):
 
 if __name__ == "__main__":
     # Test the data generation
-    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
 
     print("Testing single example generation:")
     example = generate_parity_example(5, CHUNK_SIZE, tokenizer)

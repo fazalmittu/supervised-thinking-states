@@ -1,12 +1,17 @@
-"""ThinkingStatesModel wrapper that handles state injection."""
+"""ThinkingStatesModel wrapper that handles state injection.
+
+Supports both GPT-2 and Qwen2.5 backbones. The backbone type is auto-detected
+from the model config.
+"""
 
 import torch
 import torch.nn as nn
-from transformers import GPT2LMHeadModel, GPT2Tokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from config import (
     HIDDEN_DIM, CHUNK_SIZE, GSM8K_CHUNK_SIZE, GSM8K_MAX_THOUGHT_LEN,
-    L_IN, L_OUT, DEVICE, MODEL_NAME, TASK, BOS_TOKEN, EOS_TOKEN
+    L_IN, L_OUT, DEVICE, MODEL_NAME, TASK, BOS_TOKEN, EOS_TOKEN,
+    GSM8K_FREEZE_BACKBONE,
 )
 from modules import (
     ThinkingBlock, CompressionBlock,
@@ -14,9 +19,22 @@ from modules import (
 )
 
 
+def _is_qwen(model_name: str) -> bool:
+    """Check if model_name refers to a Qwen model."""
+    return "qwen" in model_name.lower()
+
+
+def _is_gpt2(model_name: str) -> bool:
+    """Check if model_name refers to a GPT-2 model."""
+    return "gpt2" in model_name.lower()
+
+
 class ThinkingStatesModel(nn.Module):
     """
-    Wrapper around GPT-2 that adds Thinking States functionality.
+    Wrapper around a causal LM backbone that adds Thinking States functionality.
+
+    Supports GPT-2 and Qwen2.5 backbones. Architecture-specific access patterns
+    (layer names, embedding locations, etc.) are abstracted behind helper methods.
 
     Key features:
     - State injection at layer L_IN via forward hook
@@ -33,14 +51,46 @@ class ThinkingStatesModel(nn.Module):
         task: str = TASK,
     ):
         super().__init__()
-
-        # Load backbone
-        self.backbone = GPT2LMHeadModel.from_pretrained(model_name)
-        self.tokenizer = GPT2Tokenizer.from_pretrained(model_name)
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-
+        self.model_name = model_name
         self.task = task
 
+        # ------------------------------------------------------------------
+        # Load backbone and tokenizer
+        # ------------------------------------------------------------------
+        load_kwargs = {}
+        if _is_qwen(model_name):
+            load_kwargs["torch_dtype"] = torch.bfloat16
+            load_kwargs["trust_remote_code"] = True
+
+        self.backbone = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
+        # Ensure pad token exists
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        # ------------------------------------------------------------------
+        # Detect architecture and extract config values
+        # ------------------------------------------------------------------
+        backbone_config = self.backbone.config
+        self.hidden_dim = getattr(backbone_config, "hidden_size",
+                                  getattr(backbone_config, "n_embd", HIDDEN_DIM))
+        num_layers = getattr(backbone_config, "num_hidden_layers",
+                             getattr(backbone_config, "n_layer", 12))
+
+        if self.task == "gsm8k":
+            self.chunk_size = GSM8K_CHUNK_SIZE
+            # Paper: L_IN = 1 (second layer, 0-indexed), L_OUT = num_layers - 2
+            self.l_in = 1
+            self.l_out = num_layers - 2
+        else:
+            self.chunk_size = chunk_size
+            self.l_in = l_in
+            self.l_out = l_out
+
+        # ------------------------------------------------------------------
+        # Add special tokens for GSM8K thinking
+        # ------------------------------------------------------------------
         if self.task == "gsm8k":
             added = self.tokenizer.add_special_tokens(
                 {"additional_special_tokens": [BOS_TOKEN, EOS_TOKEN]}
@@ -49,37 +99,32 @@ class ThinkingStatesModel(nn.Module):
                 self.backbone.resize_token_embeddings(len(self.tokenizer))
 
         vocab_size = len(self.tokenizer)
-        hidden_dim = self.backbone.config.n_embd
 
-        if self.task == "gsm8k":
-            self.chunk_size = GSM8K_CHUNK_SIZE
-        else:
-            self.chunk_size = chunk_size
-        self.l_in = l_in
-        self.l_out = l_out
-        self.hidden_dim = hidden_dim
-
+        # ------------------------------------------------------------------
         # Thinking States modules
+        # ------------------------------------------------------------------
         if self.task == "gsm8k":
             self.thinking_block = AutoregressiveThinkingBlock(
                 vocab_size,
-                hidden_dim=hidden_dim,
+                hidden_dim=self.hidden_dim,
                 max_thought_len=GSM8K_MAX_THOUGHT_LEN,
                 chunk_size=self.chunk_size,
-                gpt2_config=self.backbone.config,
+                backbone_config=backbone_config,
+                model_name=model_name,
             )
             self.compression_block = TransformerCompressionBlock(
                 vocab_size,
-                hidden_dim=hidden_dim,
+                hidden_dim=self.hidden_dim,
                 chunk_size=self.chunk_size,
                 max_thought_len=GSM8K_MAX_THOUGHT_LEN,
-                gpt2_config=self.backbone.config,
+                backbone_config=backbone_config,
+                model_name=model_name,
                 pad_token_id=self.tokenizer.pad_token_id,
             )
             self._init_gsm8k_modules_from_backbone()
         else:
-            self.thinking_block = ThinkingBlock(vocab_size, hidden_dim)
-            self.compression_block = CompressionBlock(vocab_size, hidden_dim, self.chunk_size)
+            self.thinking_block = ThinkingBlock(vocab_size, self.hidden_dim)
+            self.compression_block = CompressionBlock(vocab_size, self.hidden_dim, self.chunk_size)
 
         # State to inject (set during forward)
         self._state_to_inject = None
@@ -88,22 +133,80 @@ class ThinkingStatesModel(nn.Module):
         # Register hooks
         self._register_hooks()
 
+        # Optionally freeze backbone
+        if self.task == "gsm8k" and GSM8K_FREEZE_BACKBONE:
+            self._freeze_backbone()
+
+        # Enable gradient checkpointing to reduce activation memory.
+        # This trades ~30% more compute for ~50% less memory during backward.
+        self.backbone.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+
+    # ==================================================================
+    # Architecture-agnostic helpers
+    # ==================================================================
+
+    def _get_layers(self):
+        """Return the nn.ModuleList of transformer layers."""
+        if _is_gpt2(self.model_name):
+            return self.backbone.transformer.h
+        else:
+            # Qwen2, LLaMA, Mistral, etc.
+            return self.backbone.model.layers
+
+    def _get_embed_tokens(self):
+        """Return the token embedding module."""
+        if _is_gpt2(self.model_name):
+            return self.backbone.transformer.wte
+        else:
+            return self.backbone.model.embed_tokens
+
+    def _get_lm_head(self):
+        """Return the LM head linear layer."""
+        return self.backbone.lm_head
+
+    # ==================================================================
+    # Initialization
+    # ==================================================================
+
     def _init_gsm8k_modules_from_backbone(self):
-        # init T from last layer of backbone (paper Appendix A.1)
-        self.thinking_block.block.load_state_dict(self.backbone.transformer.h[-1].state_dict())
+        """Initialize T and C blocks from backbone layers (paper Appendix A.1)."""
+        layers = self._get_layers()
+        embed = self._get_embed_tokens()
+        lm_head = self._get_lm_head()
 
-        # init C from first layer of backbone (paper Appendix A.1)
-        self.compression_block.encoder.load_state_dict(self.backbone.transformer.h[0].state_dict())
+        # Init T from last backbone layer
+        self.thinking_block.block.load_state_dict(layers[-1].state_dict())
 
-        # Share token embedding with backbone (paper: "embedding layer is shared with Mθ")
-        self.thinking_block.token_embedding = self.backbone.transformer.wte
-        self.compression_block.embedding = self.backbone.transformer.wte
+        # Init C from first backbone layer
+        self.compression_block.encoder.load_state_dict(layers[0].state_dict())
 
-        # Init T unembedding from backbone (paper: "independent copy")
+        # Share token embedding with backbone
+        self.thinking_block.token_embedding = embed
+        self.compression_block.embedding = embed
+
+        # Init T unembedding from backbone LM head (paper: "independent copy")
         with torch.no_grad():
-            self.thinking_block.lm_head.weight.copy_(self.backbone.lm_head.weight)
-            if self.thinking_block.lm_head.bias is not None and self.backbone.lm_head.bias is not None:
-                self.thinking_block.lm_head.bias.copy_(self.backbone.lm_head.bias)
+            self.thinking_block.lm_head.weight.copy_(lm_head.weight)
+            if self.thinking_block.lm_head.bias is not None and lm_head.bias is not None:
+                self.thinking_block.lm_head.bias.copy_(lm_head.bias)
+
+    def _freeze_backbone(self):
+        """Freeze all backbone parameters; only T and C remain trainable."""
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+        # Make sure T and C are trainable (they have their own copies of layer weights)
+        for param in self.thinking_block.parameters():
+            param.requires_grad = True
+        for param in self.compression_block.parameters():
+            param.requires_grad = True
+        # The shared embedding is frozen (backbone owns it) but that's fine:
+        # T and C don't need to update embeddings, they just use them.
+
+    # ==================================================================
+    # Hooks
+    # ==================================================================
 
     def _register_hooks(self):
         """Register forward hooks for state injection and hidden extraction."""
@@ -111,29 +214,32 @@ class ThinkingStatesModel(nn.Module):
         def injection_hook(module, input, output):
             """Inject state at layer L_IN via direct addition (paper Eq. 1: X̃_i = X_i + S_i)."""
             if self._state_to_inject is not None:
-                # output is a tuple: (hidden_states, ...) or just hidden_states
                 if isinstance(output, tuple):
                     hidden = output[0]
-                    hidden = hidden + self._state_to_inject
+                    # Cast state to match hidden dtype (important for bf16 backbone)
+                    state = self._state_to_inject.to(dtype=hidden.dtype, device=hidden.device)
+                    hidden = hidden + state
                     return (hidden,) + output[1:]
                 else:
-                    return output + self._state_to_inject
+                    state = self._state_to_inject.to(dtype=output.dtype, device=output.device)
+                    return output + state
             return output
 
         def extraction_hook(module, input, output):
             """Extract hidden states at layer L_OUT."""
             if isinstance(output, tuple):
-                self._extracted_hidden = output[0].clone()
+                self._extracted_hidden = output[0].clone().float()  # always float32
             else:
-                self._extracted_hidden = output.clone()
+                self._extracted_hidden = output.clone().float()
             return output
 
-        # Get the transformer blocks
-        blocks = self.backbone.transformer.h
+        layers = self._get_layers()
+        layers[self.l_in].register_forward_hook(injection_hook)
+        layers[self.l_out].register_forward_hook(extraction_hook)
 
-        # Register hooks
-        blocks[self.l_in].register_forward_hook(injection_hook)
-        blocks[self.l_out].register_forward_hook(extraction_hook)
+    # ==================================================================
+    # State construction
+    # ==================================================================
 
     def build_state_tensor(
         self,
@@ -148,15 +254,6 @@ class ThinkingStatesModel(nn.Module):
         Per the paper (Eq. 1, 4, 5): S_1 = 0 (first chunk gets zero state),
         and S_{i+1} = C(Z*_i) -- the thought from chunk i is compressed and
         injected into chunk i+1's token positions.
-
-        Args:
-            chunk_thought_ids: List of (batch, thought_len) tensors, one per chunk.
-                               chunk_thought_ids[i] contains the thought target for chunk i.
-            seq_len: Total sequence length
-            batch_size: Batch size
-
-        Returns:
-            state_tensor: (batch, seq_len, hidden_dim)
         """
         device = next(self.parameters()).device
         state_tensor = torch.zeros(batch_size, seq_len, self.hidden_dim, device=device)
@@ -164,22 +261,17 @@ class ThinkingStatesModel(nn.Module):
         num_chunks = len(chunk_thought_ids)
 
         for chunk_idx, thought_ids in enumerate(chunk_thought_ids):
-            # The thought from chunk_idx is injected into chunk_idx + 1.
-            # chunk 0's thought -> injected into chunk 1's positions
-            # chunk K-1's thought -> would go into chunk K (beyond input), so skip.
             target_chunk = chunk_idx + 1
             if target_chunk >= num_chunks:
                 break
 
-            # Compress thoughts to state
             thought_ids = thought_ids.to(device)
             if chunk_thought_masks is not None:
                 thought_mask = chunk_thought_masks[chunk_idx].to(device)
                 chunk_state = self.compression_block(thought_ids, attention_mask=thought_mask)
             else:
-                chunk_state = self.compression_block(thought_ids)  # (batch, chunk_size, hidden_dim)
+                chunk_state = self.compression_block(thought_ids)
 
-            # Place in state tensor at the *next* chunk's positions
             start_pos = target_chunk * self.chunk_size
             end_pos = min(start_pos + self.chunk_size, seq_len)
             if start_pos >= seq_len:
@@ -189,6 +281,10 @@ class ThinkingStatesModel(nn.Module):
             state_tensor[:, start_pos:end_pos, :] = chunk_state[:, :actual_len, :]
 
         return state_tensor
+
+    # ==================================================================
+    # Forward
+    # ==================================================================
 
     def forward(
         self,
@@ -201,17 +297,10 @@ class ThinkingStatesModel(nn.Module):
         """
         Forward pass with teacher-forced state injection.
 
-        Args:
-            input_ids: (batch, seq_len)
-            attention_mask: (batch, seq_len)
-            labels: (batch, seq_len) for LM loss
-            chunk_thought_ids: List of (batch, thought_len) tensors for teacher forcing
-
         Returns:
             dict with lm_loss, thinking_loss, extracted_hidden
         """
         batch_size, seq_len = input_ids.shape
-        device = input_ids.device
 
         # Build state tensor from teacher-forced thoughts
         if chunk_thought_ids is not None:
@@ -226,7 +315,7 @@ class ThinkingStatesModel(nn.Module):
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
-            output_hidden_states=True
+            output_hidden_states=True,
         )
 
         lm_loss = outputs.loss if labels is not None else None
@@ -257,25 +346,14 @@ class ThinkingStatesModel(nn.Module):
         chunk_thought_ids: list,
         chunk_thought_masks: list = None,
     ) -> torch.Tensor:
-        """
-        Compute cross-entropy loss for thinking block predictions.
-
-        Args:
-            extracted_hidden: (batch, seq_len, hidden_dim)
-            chunk_thought_ids: List of (batch, thought_len) tensors
-
-        Returns:
-            thinking_loss: scalar tensor
-        """
+        """Compute cross-entropy loss for thinking block predictions."""
         batch_size, seq_len, _ = extracted_hidden.shape
-        num_chunks = len(chunk_thought_ids)
         device = extracted_hidden.device
 
         total_loss = 0.0
         num_valid = 0
 
         for chunk_idx, thought_ids in enumerate(chunk_thought_ids):
-            # Get hidden states for this chunk
             start_pos = chunk_idx * self.chunk_size
             end_pos = min(start_pos + self.chunk_size, seq_len)
 
@@ -284,7 +362,6 @@ class ThinkingStatesModel(nn.Module):
 
             chunk_hidden = extracted_hidden[:, start_pos:end_pos, :]
 
-            # Pad if chunk is smaller than chunk_size
             if chunk_hidden.shape[1] < self.chunk_size:
                 pad_len = self.chunk_size - chunk_hidden.shape[1]
                 padding = torch.zeros(batch_size, pad_len, self.hidden_dim, device=device)
@@ -296,11 +373,7 @@ class ThinkingStatesModel(nn.Module):
                 if chunk_thought_masks is not None:
                     thought_mask = chunk_thought_masks[chunk_idx].to(device)
 
-                logits = self.thinking_block(
-                    chunk_hidden,
-                    thought_ids,
-                    thought_mask
-                )
+                logits = self.thinking_block(chunk_hidden, thought_ids, thought_mask)
 
                 labels = thought_ids[:, 1:].contiguous()
                 if thought_mask is not None:
@@ -313,10 +386,7 @@ class ThinkingStatesModel(nn.Module):
                     labels.view(-1)
                 )
             else:
-                # Get logits from thinking block (direct prediction, no shifting)
                 logits = self.thinking_block(chunk_hidden, thought_ids)
-
-                # Compute cross-entropy loss (direct prediction)
                 loss_fn = nn.CrossEntropyLoss(ignore_index=self.tokenizer.pad_token_id)
                 chunk_loss = loss_fn(
                     logits.view(-1, logits.size(-1)),
@@ -333,33 +403,28 @@ class ThinkingStatesModel(nn.Module):
 
 
 if __name__ == "__main__":
-    # Test the model
     print("Loading model...")
     model = ThinkingStatesModel()
     model.to(DEVICE)
 
     print(f"Model loaded on {DEVICE}")
+    print(f"Backbone: {model.model_name}")
+    print(f"Hidden dim: {model.hidden_dim}")
+    print(f"L_IN: {model.l_in}, L_OUT: {model.l_out}")
+    print(f"Chunk size: {model.chunk_size}")
 
-    # Test forward pass
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"Trainable params: {trainable:,} / {total:,} ({100*trainable/total:.1f}%)")
+
+    # Quick forward test
     tokenizer = model.tokenizer
-    text = "Start: heads. Flip. Flip. Answer:"
+    text = "What is 2 + 2?\nAnswer:"
     encoded = tokenizer(text, return_tensors="pt")
     input_ids = encoded["input_ids"].to(DEVICE)
+    print(f"\nTest input: {text}")
+    print(f"Token count: {input_ids.shape[1]}")
 
-    # Create dummy chunk thoughts
-    thought_texts = ["tails", "heads"]
-    chunk_thought_ids = [
-        tokenizer(t, return_tensors="pt")["input_ids"].to(DEVICE)
-        for t in thought_texts
-    ]
-
-    print("Running forward pass...")
-    outputs = model(
-        input_ids=input_ids,
-        labels=input_ids,
-        chunk_thought_ids=chunk_thought_ids
-    )
-
+    outputs = model(input_ids=input_ids, labels=input_ids)
     print(f"LM loss: {outputs['lm_loss']}")
-    print(f"Thinking loss: {outputs['thinking_loss']}")
     print(f"Extracted hidden shape: {outputs['extracted_hidden'].shape}")
