@@ -1,28 +1,41 @@
-"""Training loop for Thinking States."""
+"""Unified training script for Thinking States.
 
+Trains either a Thinking States model or a vanilla baseline, on either the
+parity task or GSM8K, depending on config.py and CLI flags.
+
+Usage:
+    python train.py                 # train Thinking States on current TASK
+    python train.py --vanilla       # train vanilla baseline on current TASK
+    python train.py --epochs 5      # override epoch count
+"""
+
+import argparse
 import math
+import os
 
 import torch
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 
 from config import (
-    DEVICE, BATCH_SIZE, NUM_EPOCHS, LEARNING_RATE,
+    DEVICE, MODEL_NAME, BATCH_SIZE, NUM_EPOCHS, LEARNING_RATE,
     TRAIN_SIZE, VAL_SIZE, MIN_FLIPS, MAX_FLIPS,
     GSM8K_BATCH_SIZE, GSM8K_NUM_EPOCHS, GSM8K_LEARNING_RATE,
     GSM8K_FREEZE_BACKBONE, TASK
 )
-from data import (
+from src.data import (
     ParityDataset, get_collate_fn,
     GSM8KDataset, get_gsm8k_collate_fn
 )
-from model import ThinkingStatesModel
+from src.model import ThinkingStatesModel
 
 
-GRAD_ACCUM_STEPS = 4  # effective batch size = GSM8K_BATCH_SIZE * GRAD_ACCUM_STEPS
-WARMUP_RATIO = 0.03   # fraction of total optimizer steps used for linear warmup
+CHECKPOINT_DIR = "checkpoints"
+GRAD_ACCUM_STEPS = 4
+WARMUP_RATIO = 0.03
 
 
 def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps):
@@ -37,12 +50,17 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     return LambdaLR(optimizer, lr_lambda)
 
 
-def train_epoch(model, dataloader, optimizer, device, scheduler=None):
-    """Train for one epoch. Loss = L_LM + L_T (paper Eq. 6, equal weighting).
+def _checkpoint_path(task: str, vanilla: bool) -> str:
+    prefix = "vanilla" if vanilla else "thinking_states"
+    return os.path.join(CHECKPOINT_DIR, f"{prefix}_{task}.pt")
 
-    Uses gradient accumulation to maintain a larger effective batch size
-    while keeping per-step memory low.  Clears MPS cache periodically.
-    """
+
+# =========================================================================
+# Thinking States training
+# =========================================================================
+
+def train_epoch_ts(model, dataloader, optimizer, device, scheduler=None):
+    """Train Thinking States for one epoch (L_LM + L_T, paper Eq. 6)."""
     model.train()
     total_lm_loss = 0.0
     total_think_loss = 0.0
@@ -68,12 +86,10 @@ def train_epoch(model, dataloader, optimizer, device, scheduler=None):
         lm_loss = outputs["lm_loss"]
         think_loss = outputs["thinking_loss"]
 
-        # Combined loss: L = L_LM + L_T (paper Eq. 6)
         loss = lm_loss
         if think_loss is not None:
             loss = loss + think_loss
 
-        # Scale loss by accumulation steps so the average is correct
         (loss / GRAD_ACCUM_STEPS).backward()
 
         total_lm_loss += lm_loss.item()
@@ -81,7 +97,6 @@ def train_epoch(model, dataloader, optimizer, device, scheduler=None):
             total_think_loss += think_loss.item()
         num_batches += 1
 
-        # Optimizer step every GRAD_ACCUM_STEPS (or at the last batch)
         if (step + 1) % GRAD_ACCUM_STEPS == 0 or (step + 1) == len(dataloader):
             torch.nn.utils.clip_grad_norm_(
                 [p for p in model.parameters() if p.requires_grad], max_norm=1.0
@@ -91,7 +106,6 @@ def train_epoch(model, dataloader, optimizer, device, scheduler=None):
                 scheduler.step()
             optimizer.zero_grad()
 
-        # Free MPS cache periodically to prevent OOM buildup
         if device == "mps" and (step + 1) % GRAD_ACCUM_STEPS == 0:
             torch.mps.empty_cache()
 
@@ -101,8 +115,8 @@ def train_epoch(model, dataloader, optimizer, device, scheduler=None):
     }
 
 
-def evaluate(model, dataloader, device):
-    """Evaluate on validation set."""
+def evaluate_ts(model, dataloader, device):
+    """Evaluate Thinking States on validation set."""
     model.eval()
     total_lm_loss = 0.0
     total_think_loss = 0.0
@@ -128,21 +142,13 @@ def evaluate(model, dataloader, device):
 
             lm_loss = outputs["lm_loss"]
             think_loss = outputs["thinking_loss"]
+            logits = outputs["logits"].float()
 
             total_lm_loss += lm_loss.item()
             if think_loss is not None:
                 total_think_loss += think_loss.item()
             num_batches += 1
 
-            # Re-run backbone to get logits for accuracy computation
-            model._state_to_inject = model.build_state_tensor(
-                chunk_thought_ids, input_ids.shape[1], input_ids.shape[0], chunk_thought_masks
-            )
-            backbone_out = model.backbone(input_ids=input_ids, attention_mask=attention_mask)
-            logits = backbone_out.logits.float()  # ensure float32 for accuracy
-            model._state_to_inject = None
-
-            # Exact-match accuracy on answer tokens
             for i in range(input_ids.shape[0]):
                 answer_mask = labels[i] != -100
                 if answer_mask.any():
@@ -153,7 +159,6 @@ def evaluate(model, dataloader, device):
                         correct += 1
                     total += 1
 
-            # Free MPS cache periodically during eval
             if device == "mps" and (step + 1) % 10 == 0:
                 torch.mps.empty_cache()
 
@@ -164,96 +169,168 @@ def evaluate(model, dataloader, device):
     }
 
 
+# =========================================================================
+# Vanilla training
+# =========================================================================
+
+def train_epoch_vanilla(model, dataloader, optimizer, device, scheduler=None):
+    """Train vanilla model for one epoch (standard LM loss)."""
+    model.train()
+    total_loss = 0.0
+    num_batches = 0
+
+    optimizer.zero_grad()
+
+    for step, batch in enumerate(tqdm(dataloader, desc="Training")):
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+        )
+        loss = outputs.loss
+
+        (loss / GRAD_ACCUM_STEPS).backward()
+
+        total_loss += loss.item()
+        num_batches += 1
+
+        if (step + 1) % GRAD_ACCUM_STEPS == 0 or (step + 1) == len(dataloader):
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+            optimizer.zero_grad()
+
+    return {"lm_loss": total_loss / num_batches}
+
+
+# =========================================================================
+# Main
+# =========================================================================
+
 def main():
+    parser = argparse.ArgumentParser(description="Train Thinking States or vanilla baseline")
+    parser.add_argument("--vanilla", action="store_true",
+                        help="Train vanilla baseline (no T/C blocks)")
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="Override epoch count from config")
+    args = parser.parse_args()
+
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
     print(f"Using device: {DEVICE}")
+    print(f"Task: {TASK}")
+    print(f"Mode: {'vanilla' if args.vanilla else 'thinking_states'}")
 
-    # Initialize model
-    print("Loading model...")
-    model = ThinkingStatesModel()
+    # ---- Select hyperparameters based on task ----
+    if TASK == "gsm8k":
+        batch_size = GSM8K_BATCH_SIZE
+        num_epochs = args.epochs or GSM8K_NUM_EPOCHS
+        learning_rate = GSM8K_LEARNING_RATE
+    else:
+        batch_size = BATCH_SIZE
+        num_epochs = args.epochs or NUM_EPOCHS
+        learning_rate = LEARNING_RATE
 
-    # Print parameter counts
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Total params:     {total_params:>14,}")
-    print(f"Trainable params: {trainable:>14,} ({100*trainable/total_params:.1f}%)")
+    # ---- Build model ----
+    if args.vanilla:
+        print(f"Loading vanilla {MODEL_NAME}...")
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
+        # All tasks now use BOS/EOS tokens for thinking supervision
+        from config import BOS_TOKEN, EOS_TOKEN
+        added = tokenizer.add_special_tokens(
+            {"additional_special_tokens": [BOS_TOKEN, EOS_TOKEN]}
+        )
+        if added > 0:
+            model.resize_token_embeddings(len(tokenizer))
+        model.to(DEVICE)
+    else:
+        print("Loading Thinking States model...")
+        model = ThinkingStatesModel()
 
-    if TASK == "gsm8k" and GSM8K_FREEZE_BACKBONE:
-        print("Backbone is FROZEN -- only training T and C blocks.")
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"Total params:     {total_params:>14,}")
+        print(f"Trainable params: {trainable:>14,} ({100*trainable/total_params:.1f}%)")
 
-    model.to(DEVICE)
+        if GSM8K_FREEZE_BACKBONE:
+            print("Backbone is FROZEN -- only training T and C blocks.")
 
-    tokenizer = model.tokenizer
+        tokenizer = model.tokenizer
+        model.to(DEVICE)
 
-    # Create datasets
+    # ---- Build datasets ----
     print("Creating datasets...")
     if TASK == "gsm8k":
         train_dataset = GSM8KDataset("train", tokenizer=tokenizer)
         val_dataset = GSM8KDataset("test", tokenizer=tokenizer)
         collate_fn = get_gsm8k_collate_fn(tokenizer)
-        batch_size = GSM8K_BATCH_SIZE
-        num_epochs = GSM8K_NUM_EPOCHS
-        learning_rate = GSM8K_LEARNING_RATE
     else:
         train_dataset = ParityDataset(TRAIN_SIZE, MIN_FLIPS, MAX_FLIPS, tokenizer)
         val_dataset = ParityDataset(VAL_SIZE, MIN_FLIPS, MAX_FLIPS, tokenizer)
         collate_fn = get_collate_fn(tokenizer)
-        batch_size = BATCH_SIZE
-        num_epochs = NUM_EPOCHS
-        learning_rate = LEARNING_RATE
 
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=collate_fn
+        train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn
     )
     val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=collate_fn
+        val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn
     )
 
-    # Only optimize trainable parameters
+    # ---- Optimizer + scheduler ----
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = AdamW(trainable_params, lr=learning_rate)
 
-    # LR scheduler: linear warmup (3% of steps) + cosine decay
-    steps_per_epoch = (len(train_loader) + GRAD_ACCUM_STEPS - 1) // GRAD_ACCUM_STEPS
-    total_opt_steps = steps_per_epoch * num_epochs
-    warmup_steps = int(total_opt_steps * WARMUP_RATIO)
-    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_opt_steps)
+    if args.vanilla:
+        steps_per_epoch = (len(train_loader) + GRAD_ACCUM_STEPS - 1) // GRAD_ACCUM_STEPS
+        total_opt_steps = steps_per_epoch * num_epochs
+        warmup_steps = int(total_opt_steps * WARMUP_RATIO)
+        scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_opt_steps)
+    else:
+        steps_per_epoch = (len(train_loader) + GRAD_ACCUM_STEPS - 1) // GRAD_ACCUM_STEPS
+        total_opt_steps = steps_per_epoch * num_epochs
+        warmup_steps = int(total_opt_steps * WARMUP_RATIO)
+        scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_opt_steps)
 
-    # Training loop
+    # ---- Training loop ----
     eff_bs = batch_size * GRAD_ACCUM_STEPS
     print(f"\nStarting training: {num_epochs} epochs, "
-          f"batch_size={batch_size} x {GRAD_ACCUM_STEPS} accum = {eff_bs} effective, "
-          f"lr={learning_rate}")
-    print(f"LR schedule: {warmup_steps} warmup steps, "
-          f"{total_opt_steps} total optimizer steps (cosine decay)")
+          f"batch_size={batch_size} x {GRAD_ACCUM_STEPS} accum = {eff_bs} effective"
+          f", lr={learning_rate}")
+
     for epoch in range(num_epochs):
         print(f"\nEpoch {epoch + 1}/{num_epochs}")
 
-        train_metrics = train_epoch(model, train_loader, optimizer, DEVICE, scheduler)
-        print(f"Train - LM Loss: {train_metrics['lm_loss']:.4f}, "
-              f"Think Loss: {train_metrics['think_loss']:.4f}")
+        if args.vanilla:
+            metrics = train_epoch_vanilla(model, train_loader, optimizer, DEVICE, scheduler)
+            print(f"Train - LM Loss: {metrics['lm_loss']:.4f}")
+        else:
+            metrics = train_epoch_ts(model, train_loader, optimizer, DEVICE, scheduler)
+            print(f"Train - LM Loss: {metrics['lm_loss']:.4f}, "
+                  f"Think Loss: {metrics['think_loss']:.4f}")
 
-        # Clear memory before eval
-        if DEVICE == "mps":
-            torch.mps.empty_cache()
+            if DEVICE == "mps":
+                torch.mps.empty_cache()
 
-        val_metrics = evaluate(model, val_loader, DEVICE)
-        print(f"Val - LM Loss: {val_metrics['lm_loss']:.4f}, "
-              f"Think Loss: {val_metrics['think_loss']:.4f}, "
-              f"Accuracy: {val_metrics['accuracy']:.2%}")
+            val_metrics = evaluate_ts(model, val_loader, DEVICE)
+            print(f"Val - LM Loss: {val_metrics['lm_loss']:.4f}, "
+                  f"Think Loss: {val_metrics['think_loss']:.4f}, "
+                  f"Accuracy: {val_metrics['accuracy']:.2%}")
 
-        # Clear memory before next epoch
-        if DEVICE == "mps":
-            torch.mps.empty_cache()
+            if DEVICE == "mps":
+                torch.mps.empty_cache()
 
-    # Save model
-    print("\nSaving model...")
-    torch.save(model.state_dict(), "thinking_states_model.pt")
+    # ---- Save checkpoint ----
+    ckpt_path = _checkpoint_path(TASK, args.vanilla)
+    print(f"\nSaving model to {ckpt_path}...")
+    torch.save(model.state_dict(), ckpt_path)
     print("Done!")
 
     return model

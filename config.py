@@ -1,7 +1,7 @@
 """Configuration for Thinking States prototype."""
 
 # Task selector: "parity" or "gsm8k"
-TASK = "gsm8k"
+TASK = "parity"
 
 # ---------------------------------------------------------------------------
 # Model backbone
@@ -16,8 +16,6 @@ HIDDEN_DIM = 768
 
 # Thinking States architecture (parity)
 CHUNK_SIZE = 8
-L_IN = 1        # Inject state after this layer
-L_OUT = 10      # Extract hidden states from this layer
 MAX_THOUGHT_LEN = 8
 
 # Training (parity)
@@ -29,7 +27,7 @@ NUM_EPOCHS = 20
 TRAIN_SIZE = 1000
 VAL_SIZE = 200
 MIN_FLIPS = 4
-MAX_FLIPS = 8
+MAX_FLIPS = 20
 TEST_MIN_FLIPS = 10
 TEST_MAX_FLIPS = 16
 
@@ -44,7 +42,7 @@ GSM8K_LEARNING_RATE = 5e-5     # paper uses standard fine-tuning LR
 GSM8K_NUM_EPOCHS = 10
 GSM8K_FREEZE_BACKBONE = False  # paper fine-tunes entire model end-to-end
 
-# GSM8K special tokens
+# Thinking special tokens 
 BOS_TOKEN = "<|thought_start|>"
 EOS_TOKEN = "<|thought_end|>"
 

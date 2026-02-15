@@ -15,7 +15,7 @@ env/
 .venv/
 
 # Model checkpoints
-*.pt
+checkpoints/
 *.pth
 *.bin
 *.safetensors
@@ -42,8 +42,10 @@ runs/
 # HuggingFace cache
 .cache/
 
+# Env
 .env
 
-ENGINEERING.md
-report.md
-CONTEXT.md
+# Generated artifacts
+eval_parity_results.png
+
+REPORT.md

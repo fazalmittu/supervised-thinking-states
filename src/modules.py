@@ -7,8 +7,8 @@ causal mask function are selected based on the backbone model name.
 import torch
 import torch.nn as nn
 
-from config import HIDDEN_DIM, CHUNK_SIZE, MAX_THOUGHT_LEN, GSM8K_CHUNK_SIZE, GSM8K_MAX_THOUGHT_LEN, DEVICE
-from utils import is_gpt2
+from config import HIDDEN_DIM, GSM8K_CHUNK_SIZE, GSM8K_MAX_THOUGHT_LEN, DEVICE
+from src.utils import is_gpt2
 
 
 # ---------------------------------------------------------------------------
@@ -93,63 +93,8 @@ def _run_decoder_layer(layer, hidden_states, attention_mask, model_name: str,
 
 
 # ---------------------------------------------------------------------------
-# Parity-task modules (unchanged, GPT-2 only)
-# ---------------------------------------------------------------------------
-
-class CompressionBlock(nn.Module):
-    """Compresses thought tokens into a state tensor (parity task)."""
-
-    def __init__(self, vocab_size: int, hidden_dim: int = HIDDEN_DIM,
-                 chunk_size: int = CHUNK_SIZE):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.chunk_size = chunk_size
-        self.embedding = nn.Embedding(vocab_size, hidden_dim)
-        self.proj = nn.Linear(hidden_dim, hidden_dim * chunk_size)
-
-    def forward(self, thought_ids: torch.Tensor) -> torch.Tensor:
-        embedded = self.embedding(thought_ids)
-        pooled = embedded.mean(dim=1)
-        state = self.proj(pooled)
-        return state.view(-1, self.chunk_size, self.hidden_dim)
-
-
-class ThinkingBlock(nn.Module):
-    """Generates thought tokens from hidden states (parity task)."""
-
-    def __init__(self, vocab_size: int, hidden_dim: int = HIDDEN_DIM,
-                 max_thought_len: int = MAX_THOUGHT_LEN, num_heads: int = 8):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.max_thought_len = max_thought_len
-        self.vocab_size = vocab_size
-
-        self.hidden_proj = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim * max_thought_len),
-        )
-        self.lm_head = nn.Linear(hidden_dim, vocab_size)
-
-    def forward(self, hidden_states, target_ids=None):
-        batch_size = hidden_states.shape[0]
-        pooled = hidden_states.mean(dim=1)
-        projected = self.hidden_proj(pooled).view(batch_size, self.max_thought_len, self.hidden_dim)
-        logits = self.lm_head(projected)
-        if target_ids is not None:
-            logits = logits[:, :target_ids.shape[1], :]
-        return logits
-
-    @torch.no_grad()
-    def generate(self, hidden_states, tokenizer, max_len=None):
-        if max_len is None:
-            max_len = self.max_thought_len
-        logits = self.forward(hidden_states, None)
-        return logits[:, :max_len, :].argmax(dim=-1)
-
-
-# ---------------------------------------------------------------------------
-# GSM8K modules (supports GPT-2 and Qwen2.5)
+# Transformer-based T and C modules (paper Appendix A.1)
+# Used for ALL tasks (parity, GSM8K, etc.)
 # ---------------------------------------------------------------------------
 
 class AutoregressiveThinkingBlock(nn.Module):
@@ -314,52 +259,3 @@ class TransformerCompressionBlock(nn.Module):
 
         state = encoded[:, -self.chunk_size:, :]
         return state
-
-
-# ---------------------------------------------------------------------------
-# Self-test
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    from transformers import GPT2LMHeadModel, GPT2Tokenizer
-
-    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-    vocab_size = tokenizer.vocab_size
-
-    print("Testing CompressionBlock (parity):")
-    comp_block = CompressionBlock(vocab_size)
-    thought_ids = torch.randint(0, vocab_size, (2, 3))
-    state = comp_block(thought_ids)
-    print(f"  Input: {thought_ids.shape} -> Output: {state.shape}")
-
-    print("\nTesting ThinkingBlock (parity):")
-    think_block = ThinkingBlock(vocab_size)
-    hidden = torch.randn(2, CHUNK_SIZE, HIDDEN_DIM)
-    target = torch.randint(0, vocab_size, (2, 4))
-    logits = think_block(hidden, target)
-    print(f"  Hidden: {hidden.shape}, Target: {target.shape} -> Logits: {logits.shape}")
-
-    print("\nTesting AutoregressiveThinkingBlock (GPT-2):")
-    gpt2 = GPT2LMHeadModel.from_pretrained("gpt2")
-    ar_think = AutoregressiveThinkingBlock(
-        vocab_size, backbone_config=gpt2.config, model_name="gpt2"
-    )
-    ar_think.token_embedding = gpt2.transformer.wte
-    hidden_gsm = torch.randn(2, GSM8K_CHUNK_SIZE, HIDDEN_DIM)
-    target_gsm = torch.randint(0, vocab_size, (2, 10))
-    logits_gsm = ar_think(hidden_gsm, target_gsm)
-    print(f"  Hidden: {hidden_gsm.shape}, Target: {target_gsm.shape} -> Logits: {logits_gsm.shape}")
-
-    print("\nTesting TransformerCompressionBlock (GPT-2):")
-    tf_comp = TransformerCompressionBlock(
-        vocab_size, backbone_config=gpt2.config, model_name="gpt2",
-        pad_token_id=tokenizer.eos_token_id,
-    )
-    tf_comp.embedding = gpt2.transformer.wte
-    thought_ids_gsm = torch.randint(0, vocab_size, (2, 20))
-    mask = torch.ones(2, 20)
-    mask[1, 15:] = 0
-    state_gsm = tf_comp(thought_ids_gsm, attention_mask=mask)
-    print(f"  Input: {thought_ids_gsm.shape} -> Output: {state_gsm.shape}")
-
-    print("\nAll tests passed!")

@@ -3,86 +3,103 @@
 import random
 import json
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import List, Dict
 import torch
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer
 
 from config import (
-    CHUNK_SIZE, MIN_FLIPS, MAX_FLIPS,
+    CHUNK_SIZE, MIN_FLIPS, MAX_FLIPS, MAX_THOUGHT_LEN,
     GSM8K_CACHE_DIR, GSM8K_MAX_THOUGHT_LEN, BOS_TOKEN, EOS_TOKEN, GSM8K_ALIGNED_SUFFIX
 )
 
 
 def generate_parity_example(
-    num_flips: int,
+    num_ops: int,
     chunk_size: int = CHUNK_SIZE,
     tokenizer: PreTrainedTokenizer = None
 ) -> Dict:
     """
-    Generate a single parity task example.
+    Generate a single parity task example matching the paper (Appendix A.4).
 
-    The task: Start with 'heads', apply num_flips flips, predict final state.
-    Ground truth thoughts are the state after each chunk of tokens.
+    Paper format:
+        "The coin starts at state heads. Alice doesn't flip the coin.
+         Bob flips the coin. Alice flips the coin.
+         The final state of the coin is heads."
+
+    Each operation gets a thought = current state after that operation.
+    Thoughts are assigned to chunks based on the token position of each op.
+
+    Args:
+        num_ops: number of operations (each is a flip or no-flip)
+        chunk_size: tokens per chunk
+        tokenizer: tokenizer for token-position alignment
 
     Returns:
-        Dict with keys: input_text, answer, chunk_thoughts
+        Dict with keys: input_text, answer, chunk_thoughts, num_chunks
     """
-    # Build input text
-    input_text = "Start: heads."
-    for _ in range(num_flips):
-        input_text += " Flip."
-    input_text += " Answer:"
-
-    # Compute states after each flip
-    state = "heads"
-    states_after_flip = []
-    for _ in range(num_flips):
-        state = "tails" if state == "heads" else "heads"
-        states_after_flip.append(state)
-
-    answer = state
-
-    # Now we need to assign thoughts to chunks based on token positions
-    # Tokenize to get token positions
     if tokenizer is None:
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
 
+    entities = ["Alice", "Bob"]
+
+    # Generate random flip/no-flip operations
+    operations = []
+    for i in range(num_ops):
+        entity = entities[i % 2]
+        does_flip = random.choice([True, False])
+        operations.append((entity, does_flip))
+
+    # Build input text (paper format)
+    input_text = "The coin starts at state heads."
+    for entity, does_flip in operations:
+        if does_flip:
+            input_text += f" {entity} flips the coin."
+        else:
+            input_text += f" {entity} doesn't flip the coin."
+
+    # Compute state after each operation
+    state = "heads"
+    states_after_op = []
+    for _, does_flip in operations:
+        if does_flip:
+            state = "tails" if state == "heads" else "heads"
+        states_after_op.append(state)
+
+    answer = state
+    input_text += f" The final state of the coin is"
+
+    # Tokenize to find token positions of each operation's end
     tokens = tokenizer.encode(input_text, add_special_tokens=False)
     num_tokens = len(tokens)
     num_chunks = (num_tokens + chunk_size - 1) // chunk_size
 
-    # Find which tokens correspond to "Flip." occurrences
-    # We'll assign the thought (state after flip) to the chunk containing that flip
-    flip_token_positions = []
-    text_so_far = "Start: heads."
-    current_pos = len(tokenizer.encode(text_so_far, add_special_tokens=False))
-
-    for i in range(num_flips):
-        text_so_far += " Flip."
+    # Find token position where each operation ends (last token of that sentence)
+    op_token_positions = []
+    text_so_far = "The coin starts at state heads."
+    for entity, does_flip in operations:
+        if does_flip:
+            text_so_far += f" {entity} flips the coin."
+        else:
+            text_so_far += f" {entity} doesn't flip the coin."
         new_pos = len(tokenizer.encode(text_so_far, add_special_tokens=False))
-        # The flip ends at new_pos - 1
-        flip_token_positions.append(new_pos - 1)
+        op_token_positions.append(new_pos - 1)  # last token of this operation
 
-    # Assign thoughts to chunks
-    # For each chunk, the thought is the state after the last flip in that chunk
-    # If no flip in chunk, thought is empty or previous state
+    # Assign thoughts to chunks: concatenate all thoughts whose operation
+    # falls within that chunk (same logic as GSM8K token-to-chunk alignment)
     chunk_thoughts = []
-    last_state = "heads"
-
     for chunk_idx in range(num_chunks):
         chunk_start = chunk_idx * chunk_size
         chunk_end = min((chunk_idx + 1) * chunk_size, num_tokens)
 
-        # Find flips that end in this chunk
-        chunk_state = last_state
-        for flip_idx, flip_pos in enumerate(flip_token_positions):
-            if chunk_start <= flip_pos < chunk_end:
-                chunk_state = states_after_flip[flip_idx]
+        thoughts_in_chunk = []
+        for op_idx, op_pos in enumerate(op_token_positions):
+            if chunk_start <= op_pos < chunk_end:
+                thoughts_in_chunk.append(states_after_op[op_idx])
 
-        chunk_thoughts.append(chunk_state)
-        last_state = chunk_state
+        # Concatenate thoughts in this chunk (like GSM8K), or empty string
+        chunk_thoughts.append(" ".join(thoughts_in_chunk) if thoughts_in_chunk else "")
 
     return {
         "input_text": input_text,
@@ -125,17 +142,17 @@ class ParityDataset(Dataset):
 
 
 def collate_fn(batch: List[Dict], tokenizer: PreTrainedTokenizer) -> Dict:
-    """
-    Collate function for DataLoader.
+    """Collate function for parity DataLoader.
 
-    Returns:
-        Dict with:
-        - input_ids: (batch, max_seq_len)
-        - attention_mask: (batch, max_seq_len)
-        - labels: (batch, max_seq_len) with -100 for non-answer tokens
-        - chunk_thought_ids: List of (batch, num_chunks) lists of token ids
-        - num_chunks: max number of chunks
+    Produces the same output format as gsm8k_collate_fn: chunk_thought_ids
+    and chunk_thought_masks with BOS/EOS wrapping so the unified Transformer
+    T/C blocks can be used for all tasks.
     """
+    bos_id = tokenizer.convert_tokens_to_ids(BOS_TOKEN)
+    eos_id = tokenizer.convert_tokens_to_ids(EOS_TOKEN)
+    if bos_id is None or eos_id is None:
+        raise ValueError("BOS/EOS tokens not found in tokenizer. Ensure model adds them.")
+
     # Tokenize inputs with answers
     full_texts = [ex["input_text"] + " " + ex["answer"] for ex in batch]
 
@@ -155,35 +172,54 @@ def collate_fn(batch: List[Dict], tokenizer: PreTrainedTokenizer) -> Dict:
         input_len = len(tokenizer.encode(ex["input_text"], add_special_tokens=False))
         labels[i, :input_len] = -100
 
-    # Tokenize chunk thoughts
+    # Build chunk_thought_ids and chunk_thought_masks (same format as GSM8K)
     max_num_chunks = max(ex["num_chunks"] for ex in batch)
 
-    # Pad chunk_thoughts to same length
     chunk_thought_texts = []
     for ex in batch:
-        thoughts = ex["chunk_thoughts"]
-        # Pad with empty thought if needed
+        thoughts = list(ex["chunk_thoughts"])
         while len(thoughts) < max_num_chunks:
-            thoughts = thoughts + [thoughts[-1]]  # Repeat last state
+            thoughts.append("")
         chunk_thought_texts.append(thoughts)
 
-    # Tokenize each chunk's thought
     chunk_thought_ids = []
+    chunk_thought_masks = []
+
+    max_thought_len = MAX_THOUGHT_LEN
+
     for chunk_idx in range(max_num_chunks):
-        thoughts_for_chunk = [chunk_thought_texts[b][chunk_idx] for b in range(len(batch))]
-        encoded_thoughts = tokenizer(
-            thoughts_for_chunk,
-            padding=True,
-            return_tensors="pt",
-            add_special_tokens=False
-        )
-        chunk_thought_ids.append(encoded_thoughts["input_ids"])
+        thought_ids_list = []
+        for b in range(len(batch)):
+            thought_text = chunk_thought_texts[b][chunk_idx].strip()
+            thought_ids = [bos_id]
+            if thought_text:
+                thought_ids += tokenizer.encode(thought_text, add_special_tokens=False)
+            thought_ids.append(eos_id)
+
+            if len(thought_ids) > max_thought_len:
+                thought_ids = thought_ids[:max_thought_len]
+                thought_ids[-1] = eos_id
+
+            thought_ids_list.append(thought_ids)
+
+        max_len = min(max_thought_len, max(len(ids) for ids in thought_ids_list))
+        padded = []
+        masks = []
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        for ids in thought_ids_list:
+            pad_len = max_len - len(ids)
+            padded.append(ids + [pad_id] * pad_len)
+            masks.append([1] * len(ids) + [0] * pad_len)
+
+        chunk_thought_ids.append(torch.tensor(padded, dtype=torch.long))
+        chunk_thought_masks.append(torch.tensor(masks, dtype=torch.long))
 
     return {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "labels": labels,
-        "chunk_thought_ids": chunk_thought_ids,  # List of (batch, thought_len) tensors
+        "chunk_thought_ids": chunk_thought_ids,
+        "chunk_thought_masks": chunk_thought_masks,
         "num_chunks": max_num_chunks,
     }
 
@@ -237,24 +273,12 @@ class GSM8KDataset(Dataset):
 
 
 def gsm8k_collate_fn(batch: List[Dict], tokenizer: PreTrainedTokenizer) -> Dict:
-    """
-    Collate function for GSM8K DataLoader.
-
-    Returns:
-        Dict with:
-        - input_ids: (batch, max_seq_len)
-        - attention_mask: (batch, max_seq_len)
-        - labels: (batch, max_seq_len) with -100 for non-answer tokens
-        - chunk_thought_ids: List of (batch, thought_len) tensors
-        - chunk_thought_masks: List of (batch, thought_len) tensors
-        - num_chunks: max number of chunks
-    """
+    """Collate function for GSM8K DataLoader."""
     bos_id = tokenizer.convert_tokens_to_ids(BOS_TOKEN)
     eos_id = tokenizer.convert_tokens_to_ids(EOS_TOKEN)
     if bos_id is None or eos_id is None:
         raise ValueError("BOS/EOS tokens not found in tokenizer. Ensure model adds them.")
 
-    # Build prompt + answer
     input_texts = [ex["question"].strip() + "\nAnswer:" for ex in batch]
     full_texts = [f"{input_texts[i]} {batch[i]['final_answer'].strip()}" for i in range(len(batch))]
 
@@ -268,13 +292,11 @@ def gsm8k_collate_fn(batch: List[Dict], tokenizer: PreTrainedTokenizer) -> Dict:
     input_ids = encoded["input_ids"]
     attention_mask = encoded["attention_mask"]
 
-    # Labels: -100 for prompt, real ids for answer
     labels = input_ids.clone()
     for i, prompt in enumerate(input_texts):
         prompt_len = len(tokenizer.encode(prompt, add_special_tokens=False))
         labels[i, :prompt_len] = -100
 
-    # Pad chunk thoughts to same number of chunks
     max_num_chunks = max(ex["num_chunks"] for ex in batch)
     chunk_thought_texts = []
     for ex in batch:
@@ -331,21 +353,3 @@ def get_gsm8k_collate_fn(tokenizer: PreTrainedTokenizer):
     def _collate(batch):
         return gsm8k_collate_fn(batch, tokenizer)
     return _collate
-
-
-if __name__ == "__main__":
-    # Test the data generation
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
-
-    print("Testing single example generation:")
-    example = generate_parity_example(5, CHUNK_SIZE, tokenizer)
-    print(f"Input: {example['input_text']}")
-    print(f"Answer: {example['answer']}")
-    print(f"Chunk thoughts: {example['chunk_thoughts']}")
-    print(f"Num chunks: {example['num_chunks']}")
-
-    print("\nTesting dataset:")
-    dataset = ParityDataset(10, tokenizer=tokenizer)
-    print(f"Dataset size: {len(dataset)}")
-    print(f"First example: {dataset[0]}")
